@@ -190,7 +190,7 @@ class AllFeatureRegressionTests(unittest.TestCase):
         fake_requests.get.assert_called_once()
         args, kwargs = fake_requests.get.call_args
         self.assertEqual(args[0], "https://ipaddress.to/api/score/8.8.8.8")
-        self.assertIn("Risk score: 2/100", result)
+        self.assertIn("Risk score: 2/100 (provider estimate)", result)
 
     def test_17_email_domain_security(self):
         class Record:
