@@ -1,9 +1,21 @@
 #!/usr/bin/env python3
-"""IP-FINDER v1.0.0 - network recon utility. Author: DevBrezz."""
+"""IP-FINDER v1.0.0 - pure-stdlib network recon toolkit. Author: DevBrezz.
 
+Dependencies: Python 3.10+ standard library ONLY.
+No third-party packages. No external binaries. No shell-outs.
+
+Layers, all hand-implemented:
+  * DNS resolver    - UDP + TCP wire format, EDNS0, DNSSEC record parsing
+  * HTTP client     - http.client + ssl, redirects, bounded streaming
+  * WHOIS client    - IANA -> TLD -> registrar referral chain, port 43
+  * TLS             - ssl module, full verification
+  * Traceroute      - ICMP raw + TCP SYN via IP_RECVERR
+  * Port probe      - raw socket connect_ex
+"""
+
+import base64
 import datetime
-import errno
-import importlib.util
+import http.client
 import ipaddress
 import json
 import os
@@ -12,38 +24,21 @@ import re
 import shutil
 import socket
 import ssl
-import string
-import subprocess
+import struct
 import sys
 import threading
 import time
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 TOOL_NAME = "IP-FINDER"
 VERSION = "1.0.0"
 AUTHOR = "DevBrezz"
 
-API_TIMEOUT = 6
-PORT_TIMEOUT = 1
-DNS_TIMEOUT = 3
-
-REQUIRED_DEPS = {"requests": "requests", "dns": "dnspython"}
-OPTIONAL_DEPS = {"whois": "python-whois", "colorama": "colorama"}
-
-COMMON_PORTS = {
-    21: "FTP", 22: "SSH", 23: "TELNET", 25: "SMTP", 53: "DNS",
-    80: "HTTP", 110: "POP3", 143: "IMAP", 443: "HTTPS",
-    3306: "MySQL", 3389: "RDP", 8080: "HTTP-Proxy",
-}
-
-COMMON_SUBDOMAINS = [
-    "www", "mail", "ftp", "webmail", "smtp", "ns1", "ns2", "blog", "vpn",
-    "m", "dev", "test", "admin", "portal", "web", "server", "ns", "shop",
-    "api", "staging", "beta", "demo",
-]
-
-DNS_RECORD_TYPES = ["A", "AAAA", "MX", "NS", "TXT", "CNAME", "SOA"]
-PROPAGATION_TYPES = ["A", "AAAA", "CNAME", "MX", "TXT", "NS"]
+HTTP_TIMEOUT = 8.0
+DNS_TIMEOUT = 3.0
+PORT_TIMEOUT = 1.0
+WHOIS_TIMEOUT = 8.0
+TLS_TIMEOUT = 6.0
 
 PUBLIC_RESOLVERS = [
     ("Google", "8.8.8.8"),
@@ -52,51 +47,54 @@ PUBLIC_RESOLVERS = [
     ("OpenDNS", "208.67.222.222"),
 ]
 
+COMMON_PORTS = {
+    21: "FTP", 22: "SSH", 23: "TELNET", 25: "SMTP", 53: "DNS",
+    80: "HTTP", 110: "POP3", 143: "IMAP", 443: "HTTPS",
+    3306: "MySQL", 3389: "RDP", 8080: "HTTP-Proxy",
+}
+
 BANNER_PORTS = [21, 22, 23, 25, 80, 110, 143, 8080]
 
-_DOMAIN_LABEL = re.compile(r"^(?!-)[A-Za-z0-9\u00a1-\uffff-]{1,63}(?<!-)$")
-_TLD_LABEL = re.compile(r"^[A-Za-z\u00a1-\uffff]{2,63}$")
+COMMON_SUBDOMAINS = [
+    "www", "mail", "ftp", "webmail", "smtp", "ns1", "ns2", "blog", "vpn",
+    "m", "dev", "test", "admin", "portal", "web", "server", "ns", "shop",
+    "api", "staging", "beta", "demo",
+]
 
-_requests = None
-_dns = None
-_whois = None
+DNS_RECORD_TYPES = ["A", "AAAA", "MX", "NS", "TXT", "CNAME", "SOA"]
 
-_color_enabled = False
-try:
-    import colorama
-    colorama.init()
-    _color_enabled = True
-except ImportError:
-    pass
-
-GREEN = "\033[92m" if _color_enabled else ""
-YELLOW = "\033[93m" if _color_enabled else ""
-RED = "\033[91m" if _color_enabled else ""
-DRED = "\033[38;5;124m" if _color_enabled else ""
-CYAN = "\033[96m" if _color_enabled else ""
-WHITE = "\033[97m" if _color_enabled else ""
-BOLD = "\033[1m" if _color_enabled else ""
-RESET = "\033[0m" if _color_enabled else ""
-
-TAKEOVER_FINGERPRINTS = {
-    "github.io": ["There isn't a GitHub Pages site here",
-                  "For root URLs (like http://example.com/) you must provide an index.html file"],
-    "herokuapp.com": ["No such app", "no-such-app.herokuapp.com"],
-    "azurewebsites.net": ["404 Web Site not found", "This Azure Web App is stopped"],
-    "cloudfront.net": ["Bad request", "ERROR: The request could not be satisfied"],
-    "fastly.net": ["Fastly error: unknown domain",
-                   "Please check that this domain has been added to a service"],
-    "s3.amazonaws.com": ["NoSuchBucket", "The specified bucket does not exist"],
-    "bitbucket.io": ["Repository not found", "The page you're looking for doesn't exist"],
-    "wordpress.com": ["Do you want to register", "doesn't exist"],
-    "tumblr.com": ["There's nothing here",
-                   "Whatever you were looking for doesn't currently exist"],
-    "myshopify.com": ["Sorry, this shop is currently unavailable"],
-    "pantheonsite.io": ["The gods are wise", "404 Not Found"],
-    "readthedocs.io": ["This domain is not configured", "404 - Not Found"],
-    "surge.sh": ["project not found"],
-    "ghost.io": ["Domain error", "404"],
+DNS_TYPE_CODES = {
+    "A": 1, "NS": 2, "CNAME": 5, "SOA": 6, "PTR": 12, "MX": 15,
+    "TXT": 16, "AAAA": 28, "SRV": 33, "DS": 43, "RRSIG": 46,
+    "DNSKEY": 48, "AXFR": 252, "ANY": 255,
 }
+DNS_TYPE_NAMES = {v: k for k, v in DNS_TYPE_CODES.items()}
+DNS_RCODES = {
+    0: "NOERROR", 1: "FORMERR", 2: "SERVFAIL", 3: "NXDOMAIN",
+    4: "NOTIMP", 5: "REFUSED", 6: "YXDOMAIN", 7: "YXRRSET",
+    8: "NXRRSET", 9: "NOTAUTH", 10: "NOTZONE",
+}
+
+IP_RECVERR_LINUX = 11
+MSG_ERRQUEUE_LINUX = 0x2000
+SO_EE_ORIGIN_ICMP = 2
+ICMP_ECHO_REQUEST = 8
+ICMP_ECHO_REPLY = 0
+ICMP_TIME_EXCEEDED = 11
+ICMP_DEST_UNREACH = 3
+
+_DOMAIN_LABEL = re.compile(r"^(?!-)[A-Za-z0-9-]{1,63}(?<!-)$")
+
+try:
+    if hasattr(sys.stdout, "isatty") and sys.stdout.isatty() and os.environ.get("TERM") != "dumb":
+        GREEN, YELLOW, RED, CYAN, DRED, BOLD, RESET = (
+            "\033[92m", "\033[93m", "\033[91m", "\033[96m",
+            "\033[38;5;124m", "\033[1m", "\033[0m",
+        )
+    else:
+        GREEN = YELLOW = RED = CYAN = DRED = BOLD = RESET = ""
+except Exception:
+    GREEN = YELLOW = RED = CYAN = DRED = BOLD = RESET = ""
 
 
 class ResultCollector:
@@ -112,12 +110,9 @@ class ResultCollector:
         return not self.sections
 
     def render(self, target):
-        out = [
-            f"{TOOL_NAME} v{VERSION} Results",
-            f"Timestamp: {datetime.datetime.now().isoformat()}",
-            f"Target: {target}",
-            "",
-        ]
+        out = [f"{TOOL_NAME} v{VERSION} Results",
+               f"Timestamp: {datetime.datetime.now().isoformat()}",
+               f"Target: {target}", ""]
         for title, lines in self.sections:
             out.append(f"== {title} ==")
             if lines:
@@ -142,7 +137,7 @@ def clear_screen():
     os.system("cls" if os.name == "nt" else "clear")
 
 
-def print_banner():
+def banner():
     art = [
         " ___ ____        _______ _           __",
         "|_ _|  _ \\      |  ___(_)_ __   __| | ___ _ __",
@@ -154,33 +149,21 @@ def print_banner():
     for line in art:
         print(line)
     print(f"{RESET}{CYAN}  {TOOL_NAME} v{VERSION}  [BY: {AUTHOR}]{RESET}")
-    print(f"{DRED}  {'=' * min(term_width() - 2, 66)}{RESET}")
-    print()
+    print(f"{DRED}  {'=' * min(term_width() - 2, 66)}{RESET}\n")
 
 
-def status(label, color, message):
-    print(f"{color}[{label}]{RESET} {message}")
+def _status(label, color, msg):
+    print(f"{color}[{label}]{RESET} {msg}")
 
 
-def info(msg):
-    status("INFO", CYAN, msg)
-
-
-def success(msg):
-    status("SUCCESS", GREEN, msg)
-
-
-def warning(msg):
-    status("WARNING", YELLOW, msg)
-
-
-def error(msg):
-    status("ERROR", RED, msg)
+def info(m):   _status("INFO", CYAN, m)
+def ok(m):     _status("SUCCESS", GREEN, m)
+def warn(m):   _status("WARNING", YELLOW, m)
+def err(m):    _status("ERROR", RED, m)
 
 
 def section(title):
-    print()
-    print(f"{BOLD}{CYAN}[::] {title.upper()}{RESET}")
+    print(f"\n{BOLD}{CYAN}[::] {title.upper()}{RESET}")
     print(f"{DRED}{'-' * min(term_width() - 2, 66)}{RESET}")
 
 
@@ -198,41 +181,22 @@ def pause():
         pass
 
 
-def check_dependencies():
-    missing_required = [pkg for mod, pkg in REQUIRED_DEPS.items()
-                        if importlib.util.find_spec(mod) is None]
-    missing_optional = [pkg for mod, pkg in OPTIONAL_DEPS.items()
-                        if importlib.util.find_spec(mod) is None]
-    return (not missing_required), missing_required, missing_optional
-
-
-def load_optional_imports():
-    global _requests, _dns, _whois
-    try:
-        import requests as _r
-        _requests = _r
-    except ImportError:
-        pass
-    try:
-        import dns as _d
-        import dns.resolver  # noqa: F401
-        _dns = _d
-    except ImportError:
-        pass
-    try:
-        import whois as _w
-        _whois = _w
-    except ImportError:
-        pass
-
-
-def _require(name):
-    mod = {"requests": _requests, "dns": _dns, "whois": _whois}.get(name)
-    if mod is None:
-        package = REQUIRED_DEPS.get(name) or OPTIONAL_DEPS.get(name, name)
-        error(f"Missing dependency: {package}")
-        print(f"  pip install {package}")
-    return mod
+def emit(title, rows, collector=None):
+    section(title)
+    lines = []
+    for row in rows:
+        if isinstance(row, tuple) and len(row) == 2:
+            label, value = row
+            line = f"{str(label):<16}{value}"
+        elif isinstance(row, tuple):
+            line = "  ".join(str(x) for x in row)
+        else:
+            line = str(row)
+        print("  " + line)
+        lines.append(line)
+    if collector is not None:
+        collector.add(title, lines)
+    return lines
 
 
 def validate_ip(value):
@@ -245,7 +209,7 @@ def validate_ip(value):
 
 def parse_ip(value):
     try:
-        return ipaddress.ip_address(value)
+        return ipaddress.ip_address(str(value).strip())
     except (ValueError, TypeError):
         return None
 
@@ -256,55 +220,27 @@ def validate_domain(domain):
     domain = domain.strip().rstrip(".")
     if not domain or len(domain) > 253 or ".." in domain:
         return False
-    try:
-        domain = domain.encode("idna").decode("ascii")
-    except (UnicodeError, ValueError):
-        return False
     labels = domain.split(".")
-    if len(labels) < 2 or not all(_DOMAIN_LABEL.fullmatch(label) for label in labels):
+    if len(labels) < 2:
         return False
-    tld = labels[-1]
-    return bool(_TLD_LABEL.fullmatch(tld) or re.fullmatch(r"xn--[a-z0-9-]{2,59}", tld, re.I))
+    if not all(_DOMAIN_LABEL.fullmatch(l) for l in labels):
+        return False
+    return len(labels[-1]) >= 2
 
 
 def normalize_url(raw):
     raw = (raw or "").strip()
-    if not raw or any(ch.isspace() for ch in raw):
+    if not raw or any(c.isspace() for c in raw):
         return None
+    if not raw.startswith(("http://", "https://")):
+        raw = "http://" + raw
     try:
         parsed = urlparse(raw)
     except ValueError:
         return None
-    if parsed.scheme and parsed.scheme.lower() not in ("http", "https"):
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
         return None
-    if parsed.scheme:
-        if not parsed.hostname or parsed.username or parsed.password:
-            return None
-        try:
-            port = parsed.port
-        except ValueError:
-            return None
-        host = parsed.hostname
-        if not (validate_ip(host) or validate_domain(host)):
-            return None
-        if port is not None and not (1 <= port <= 65535):
-            return None
-        return raw
-    if ":" in raw and not raw.startswith("["):
-        try:
-            ipaddress.IPv6Address(raw)
-            return f"http://[{raw}]"
-        except ValueError:
-            pass
-    candidate = "http://" + raw
-    try:
-        parsed = urlparse(candidate)
-        hostname = parsed.hostname
-    except ValueError:
-        return None
-    if not hostname or parsed.username or parsed.password:
-        return None
-    if not (validate_ip(hostname) or validate_domain(hostname)):
+    if parsed.username or parsed.password:
         return None
     try:
         port = parsed.port
@@ -312,7 +248,9 @@ def normalize_url(raw):
         return None
     if port is not None and not (1 <= port <= 65535):
         return None
-    return candidate
+    if not (validate_ip(parsed.hostname) or validate_domain(parsed.hostname)):
+        return None
+    return raw
 
 
 def classify_target(value):
@@ -323,2285 +261,2093 @@ def classify_target(value):
         try:
             parsed = urlparse(value)
             host = parsed.hostname
-            port = parsed.port
+            _ = parsed.port
         except ValueError:
             return ("invalid", None)
-        if not host or parsed.username or parsed.password or (port is not None and not 1 <= port <= 65535):
+        if not host:
             return ("invalid", None)
         value = host
     if validate_ip(value):
         return ("ip", value)
     if validate_domain(value):
-        try:
-            value = value.rstrip(".").encode("idna").decode("ascii").lower()
-        except UnicodeError:
-            return ("invalid", value)
-        return ("domain", value)
+        return ("domain", value.rstrip("."))
     return ("invalid", value)
 
 
-def http_get_json(url, accept=None, timeout=API_TIMEOUT):
-    requests = _require("requests")
-    if not requests:
-        return None, "requests not available"
-    headers = {"Accept": accept} if accept else {}
-    try:
-        r = requests.get(url, timeout=timeout, headers=headers)
-        r.raise_for_status()
-        return r.json(), None
-    except requests.exceptions.RequestException as exc:
-        return None, f"{type(exc).__name__}: {exc}"
-    except ValueError:
-        return None, "response was not JSON"
+class DNSError(Exception):
+    pass
 
 
-def get_my_ip():
-    requests = _require("requests")
-    if not requests:
-        return None
-    try:
-        info("Contacting public IP service...")
-        r = requests.get("https://api.ipify.org", timeout=API_TIMEOUT)
-        r.raise_for_status()
-        ip = r.text.strip()
-        if not validate_ip(ip):
-            error("Public IP API returned an invalid address.")
+def _encode_qname(name):
+    if name.endswith("."):
+        name = name[:-1]
+    if not name:
+        return b"\x00"
+    out = b""
+    for label in name.split("."):
+        try:
+            raw = label.encode("idna") if not label.isascii() else label.encode("ascii")
+        except UnicodeError as exc:
+            raise DNSError(f"invalid label: {label}") from exc
+        if not raw or len(raw) > 63:
+            raise DNSError(f"invalid label length: {label}")
+        out += bytes([len(raw)]) + raw
+    return out + b"\x00"
+
+
+def _decode_qname(buf, offset):
+    labels = []
+    start = offset
+    jumped = False
+    seen = set()
+    while True:
+        if offset >= len(buf):
+            raise DNSError("truncated name")
+        length = buf[offset]
+        if length == 0:
+            offset += 1
+            break
+        if length & 0xC0 == 0xC0:
+            if offset + 1 >= len(buf):
+                raise DNSError("truncated pointer")
+            pointer = ((length & 0x3F) << 8) | buf[offset + 1]
+            if pointer in seen or pointer >= len(buf):
+                raise DNSError("compression loop")
+            seen.add(pointer)
+            if not jumped:
+                start = offset + 2
+            offset = pointer
+            jumped = True
+            continue
+        if length > 63 or offset + 1 + length > len(buf):
+            raise DNSError("invalid label")
+        try:
+            labels.append(buf[offset + 1:offset + 1 + length].decode("ascii"))
+        except UnicodeDecodeError:
+            labels.append(buf[offset + 1:offset + 1 + length].decode("utf-8", "replace"))
+        offset += 1 + length
+    return (".".join(labels) or "."), (start if jumped else offset)
+
+
+def _dns_build_query(qname, qtype, edns_do=False):
+    tid = random.getrandbits(16)
+    flags = 0x0100
+    arcount = 1 if edns_do else 0
+    header = struct.pack("!HHHHHH", tid, flags, 1, 0, 0, arcount)
+    question = _encode_qname(qname) + struct.pack("!HH", qtype, 1)
+    body = header + question
+    if edns_do:
+        opt = b"\x00" + struct.pack("!HHIH", 41, 4096, 0x00008000, 0)
+        body += opt
+    return tid, body
+
+
+def _dns_parse(buf, expected_id=None):
+    if len(buf) < 12:
+        raise DNSError("short header")
+    tid, flags, qd, an, ns, ar = struct.unpack("!HHHHHH", buf[:12])
+    if expected_id is not None and tid != expected_id:
+        raise DNSError("transaction id mismatch")
+    rcode = flags & 0x0F
+    tc = bool(flags & 0x0200)
+    aa = bool(flags & 0x0400)
+
+    offset = 12
+    questions = []
+    for _ in range(qd):
+        name, offset = _decode_qname(buf, offset)
+        if offset + 4 > len(buf):
+            raise DNSError("short question")
+        qtype, qclass = struct.unpack("!HH", buf[offset:offset + 4])
+        offset += 4
+        questions.append({"name": name, "type": qtype, "class": qclass})
+
+    def read_rr():
+        nonlocal offset
+        name, offset = _decode_qname(buf, offset)
+        if offset + 10 > len(buf):
+            raise DNSError("short rr")
+        rtype, rclass, ttl, rdlen = struct.unpack("!HHIH", buf[offset:offset + 10])
+        offset += 10
+        rd_start = offset
+        if offset + rdlen > len(buf):
+            raise DNSError("short rdata")
+        offset += rdlen
+        return {"name": name, "type": rtype, "class": rclass, "ttl": ttl,
+                "rdata_start": rd_start, "rdlen": rdlen}
+
+    answers = [read_rr() for _ in range(an)]
+    authority = [read_rr() for _ in range(ns)]
+    additional = [read_rr() for _ in range(ar)]
+
+    def decode_value(rr):
+        t = rr["type"]
+        s = rr["rdata_start"]
+        ln = rr["rdlen"]
+        raw = buf[s:s + ln]
+        try:
+            if t == 1 and ln == 4:
+                return socket.inet_ntoa(raw)
+            if t == 28 and ln == 16:
+                return socket.inet_ntop(socket.AF_INET6, raw)
+            if t in (2, 5, 12):
+                name, _ = _decode_qname(buf, s)
+                return name
+            if t == 15 and ln >= 3:
+                pref = struct.unpack("!H", raw[:2])[0]
+                name, _ = _decode_qname(buf, s + 2)
+                return f"{pref} {name}"
+            if t == 16:
+                parts = []
+                i = 0
+                while i < ln:
+                    slen = raw[i]
+                    i += 1
+                    if i + slen > ln:
+                        break
+                    parts.append(raw[i:i + slen].decode("utf-8", "replace"))
+                    i += slen
+                return " ".join(parts)
+            if t == 6 and ln >= 22:
+                mname, off = _decode_qname(buf, s)
+                rname, off = _decode_qname(buf, off)
+                if off + 20 > s + ln:
+                    return None
+                serial, refresh, retry, expire, minimum = struct.unpack(
+                    "!IIIII", buf[off:off + 20])
+                return f"{mname} {rname} {serial} {refresh} {retry} {expire} {minimum}"
+            if t == 43 and ln >= 4:
+                kt, algo, dt = struct.unpack("!HBB", raw[:4])
+                return f"{kt} {algo} {dt} {raw[4:].hex()}"
+            if t == 48 and ln >= 4:
+                fl, pr, al = struct.unpack("!HBB", raw[:4])
+                return f"{fl} {pr} {al} {raw[4:].hex()}"
+            if t == 46:
+                return raw.hex()[:80] + ("..." if ln > 40 else "")
+        except Exception:
             return None
-        success(f"Public IP: {GREEN}{ip}{RESET}")
-        return ip
-    except Exception as exc:
-        error(f"Failed to obtain public IP: {exc}")
-        return None
+        return raw.hex()
+
+    for group in (answers, authority, additional):
+        for rr in group:
+            rr["value"] = decode_value(rr)
+            rr["type_name"] = DNS_TYPE_NAMES.get(rr["type"], str(rr["type"]))
+    return {"id": tid, "rcode": rcode, "rcode_name": DNS_RCODES.get(rcode, "UNKNOWN"),
+            "aa": aa, "tc": tc, "questions": questions,
+            "answers": answers, "authority": authority, "additional": additional}
 
 
-def reverse_dns_lookup(ip):
-    parsed = parse_ip(ip)
-    if not parsed:
-        error(f"Invalid IP address: {ip}")
-        return None
+def _recv_exact(sock, n):
+    buf = b""
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        if not chunk:
+            break
+        buf += chunk
+    return buf
+
+
+def _dns_udp(ns, packet, tid, timeout):
+    family = socket.AF_INET6 if ":" in ns else socket.AF_INET
+    sock = socket.socket(family, socket.SOCK_DGRAM)
     try:
-        info("Reverse DNS query...")
-        domain = socket.gethostbyaddr(str(parsed))[0]
-        success(f"{parsed} -> {GREEN}{domain}{RESET}")
-        return domain
-    except socket.herror:
-        warning("No reverse DNS entry found.")
-    except socket.gaierror as exc:
-        error(f"Resolution error: {exc}")
-    except Exception as exc:
-        error(f"Lookup failed: {exc}")
-    return None
+        sock.settimeout(timeout)
+        sock.sendto(packet, (ns, 53))
+        deadline = time.monotonic() + timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise DNSError("udp timeout")
+            sock.settimeout(remaining)
+            try:
+                buf, _ = sock.recvfrom(65535)
+            except socket.timeout:
+                raise DNSError("udp timeout")
+            if len(buf) >= 2 and struct.unpack("!H", buf[:2])[0] == tid:
+                return buf
+    finally:
+        sock.close()
 
 
-def domain_to_ip(domain):
-    if not validate_domain(domain):
-        error(f"Invalid domain: {domain}")
-        return None
+def _dns_tcp(ns, packet, timeout):
+    family = socket.AF_INET6 if ":" in ns else socket.AF_INET
+    sock = socket.socket(family, socket.SOCK_STREAM)
     try:
-        info("Resolving domain...")
-        infos = socket.getaddrinfo(domain, None)
-        ips = sorted({item[4][0] for item in infos})
-        for ip in ips:
-            success(f"{domain} -> {GREEN}{ip}{RESET}")
-        return ips
-    except socket.gaierror:
-        error("Domain resolution failed.")
-    except Exception as exc:
-        error(f"Lookup error: {exc}")
-    return None
+        sock.settimeout(timeout)
+        sock.connect((ns, 53))
+        sock.sendall(struct.pack("!H", len(packet)) + packet)
+        hdr = _recv_exact(sock, 2)
+        if len(hdr) < 2:
+            raise DNSError("tcp short header")
+        ln = struct.unpack("!H", hdr)[0]
+        buf = _recv_exact(sock, ln)
+        if not buf:
+            raise DNSError("tcp empty")
+        return buf
+    finally:
+        sock.close()
 
 
-def web_ip_checker(raw_url):
-    normalized = normalize_url(raw_url)
-    if not normalized:
-        error("Invalid website URL. Enter a hostname or an http(s) URL.")
-        return []
+def _system_nameservers():
+    nameservers = []
+    for path in ("/etc/resolv.conf", "/system/etc/resolv.conf"):
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if line.startswith("nameserver"):
+                        parts = line.split()
+                        if len(parts) >= 2:
+                            addr = parts[1].split("%")[0]
+                            if validate_ip(addr):
+                                nameservers.append(addr)
+        except OSError:
+            continue
+    return nameservers
+
+
+def dns_resolve(qname, qtype="A", server=None, timeout=DNS_TIMEOUT,
+                edns_do=False, use_tcp=False):
+    if isinstance(qtype, str):
+        upper = qtype.upper()
+        if upper not in DNS_TYPE_CODES:
+            raise DNSError(f"unsupported type: {qtype}")
+        qtype_num = DNS_TYPE_CODES[upper]
+    else:
+        qtype_num = int(qtype)
+
+    candidates = [server] if server else _system_nameservers() or ["1.1.1.1", "8.8.8.8"]
+    last_error = None
+    for ns in candidates:
+        try:
+            started = time.monotonic()
+            tid, packet = _dns_build_query(qname, qtype_num, edns_do)
+            if use_tcp:
+                buf = _dns_tcp(ns, packet, timeout)
+            else:
+                buf = _dns_udp(ns, packet, tid, timeout)
+                parsed = _dns_parse(buf, tid)
+                if parsed["tc"]:
+                    buf = _dns_tcp(ns, packet, timeout)
+            parsed = _dns_parse(buf, tid)
+            parsed["server"] = ns
+            parsed["elapsed_ms"] = (time.monotonic() - started) * 1000
+            return parsed
+        except (DNSError, OSError) as exc:
+            last_error = exc
+    raise DNSError(f"all resolvers failed: {last_error}")
+
+
+def dns_axfr(ns_ip, domain, timeout=8.0):
+    tid, packet = _dns_build_query(domain, DNS_TYPE_CODES["AXFR"])
+    family = socket.AF_INET6 if ":" in ns_ip else socket.AF_INET
+    sock = socket.socket(family, socket.SOCK_STREAM)
     try:
-        parsed = urlparse(normalized)
+        sock.settimeout(timeout)
+        sock.connect((ns_ip, 53))
+        sock.sendall(struct.pack("!H", len(packet)) + packet)
+        records = []
+        soa_seen = 0
+        for _ in range(200):
+            hdr = _recv_exact(sock, 2)
+            if len(hdr) < 2:
+                break
+            ln = struct.unpack("!H", hdr)[0]
+            body = _recv_exact(sock, ln)
+            if not body:
+                break
+            parsed = _dns_parse(body, tid)
+            if parsed["rcode"] != 0:
+                raise DNSError(f"AXFR refused: {parsed['rcode_name']}")
+            for rr in parsed["answers"]:
+                records.append(rr)
+                if rr["type"] == 6:
+                    soa_seen += 1
+                    if soa_seen >= 2:
+                        return records
+        return records
+    finally:
+        sock.close()
+
+
+class HTTPError(Exception):
+    pass
+
+
+def http_request(method, url, headers=None, timeout=HTTP_TIMEOUT,
+                 allow_redirects=True, max_redirects=5, read_limit=None):
+    start = time.monotonic()
+    history = []
+    current = url
+    for _ in range(max_redirects + 1):
+        parsed = urlparse(current)
+        if parsed.scheme not in ("http", "https"):
+            raise HTTPError(f"unsupported scheme: {parsed.scheme}")
         host = parsed.hostname
         if not host:
-            error("Could not extract a hostname from the URL.")
-            return []
-        info(f"Resolving website host: {host}")
-        answers = socket.getaddrinfo(host, parsed.port or (443 if parsed.scheme == "https" else 80),
-                                     type=socket.SOCK_STREAM)
-        ipv4, ipv6 = set(), set()
-        for answer in answers:
-            address = answer[4][0]
-            try:
-                parsed_ip = ipaddress.ip_address(address)
-            except ValueError:
-                continue
-            (ipv4 if parsed_ip.version == 4 else ipv6).add(str(parsed_ip))
-        results = [f"URL: {normalized}", f"Hostname: {host}"]
-        if ipv4:
-            results.extend(f"IPv4: {address}" for address in sorted(ipv4))
-        if ipv6:
-            results.extend(f"IPv6: {address}" for address in sorted(ipv6))
-        if not ipv4 and not ipv6:
-            warning("DNS returned no IP addresses.")
-            return results
-        for line in results[2:]:
-            success(line)
-        warning("These are the IP addresses returned by public DNS. If the site uses a CDN, reverse proxy, or load balancer, its private origin IP cannot reliably be determined from the URL alone.")
-        results.append("Note: DNS results may be CDN/proxy/load-balancer addresses, not the origin server.")
-        return results
-    except socket.gaierror as exc:
-        error(f"DNS resolution failed: {exc}")
-    except Exception as exc:
-        error(f"Web IP check failed: {type(exc).__name__}: {exc}")
-    return []
-
-
-def lookup_dns_records(domain):
-    dns = _require("dns")
-    if not dns:
-        return None
-    import dns.resolver
-    if not validate_domain(domain):
-        error(f"Invalid domain: {domain}")
-        return None
-    collected = {}
-    info(f"Querying DNS for {domain}...")
-    for rtype in DNS_RECORD_TYPES:
+            raise HTTPError("missing host")
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        path = parsed.path or "/"
+        if parsed.query:
+            path += "?" + parsed.query
+        req_headers = {"User-Agent": f"{TOOL_NAME}/{VERSION}",
+                       "Accept": "*/*", "Connection": "close"}
+        if headers:
+            req_headers.update(headers)
+        if parsed.scheme == "https":
+            context = ssl.create_default_context()
+            conn = http.client.HTTPSConnection(host, port, timeout=timeout, context=context)
+        else:
+            conn = http.client.HTTPConnection(host, port, timeout=timeout)
         try:
-            answers = dns.resolver.resolve(domain, rtype, lifetime=DNS_TIMEOUT)
-            records = [rdata.to_text() for rdata in answers]
-        except dns.resolver.NoAnswer:
-            continue
-        except dns.resolver.NXDOMAIN:
-            error("Domain does not exist.")
-            break
-        except dns.resolver.NoNameservers:
-            warning(f"{rtype}: no nameservers answered.")
-            continue
-        except dns.resolver.LifetimeTimeout:
-            warning(f"{rtype}: query timed out.")
-            continue
-        except Exception as exc:
-            warning(f"{rtype} failed: {type(exc).__name__}")
-            continue
-        if records:
-            collected[rtype] = records
-    if not collected:
-        warning("No DNS records returned.")
-        return None
-    section(f"DNS records - {domain}")
-    print(f"  {'Type':<8}{'Value'}")
-    for rtype, records in collected.items():
-        for i, record in enumerate(records):
-            tag = rtype if i == 0 else ""
-            print(f"  {tag:<8}{record}")
-    return collected
+            conn.request(method, path, headers=req_headers)
+            resp = conn.getresponse()
+        except Exception:
+            try: conn.close()
+            except Exception: pass
+            raise
+        raw_headers = resp.getheaders()
+        header_map = {}
+        for k, v in raw_headers:
+            header_map.setdefault(k.lower(), []).append(v)
+        body = b""
+        truncated = False
+        try:
+            if read_limit is not None:
+                chunk = resp.read(read_limit + 1)
+                if len(chunk) > read_limit:
+                    body = chunk[:read_limit]
+                    truncated = True
+                else:
+                    body = chunk
+            else:
+                body = resp.read()
+        except Exception:
+            truncated = True
+        conn.close()
+        elapsed_ms = (time.monotonic() - start) * 1000
+        if allow_redirects and resp.status in (301, 302, 303, 307, 308):
+            location = header_map.get("location", [None])[0]
+            if location:
+                history.append({"url": current, "status": resp.status, "location": location})
+                current = urljoin(current, location)
+                continue
+        return {"url": current, "status": resp.status, "reason": resp.reason,
+                "headers": header_map, "raw_headers": raw_headers,
+                "body": body, "body_truncated": truncated,
+                "history": history, "elapsed_ms": elapsed_ms}
+    raise HTTPError(f"too many redirects (> {max_redirects})")
 
 
-def ip_geo_info(ip):
-    requests = _require("requests")
-    if not requests:
-        return None
-    parsed = parse_ip(ip)
-    if not parsed:
-        error(f"Invalid IP address: {ip}")
-        return None
-    info("Querying geolocation (ipwho.is, HTTPS)...")
-    data, err = http_get_json(f"https://ipwho.is/{parsed}")
-    if err:
-        error(f"GeoIP failed: {err}")
-        return None
-    if not data or not data.get("success", False):
-        error(f"GeoIP error: {data.get('message', 'unknown') if data else 'no data'}")
-        return None
-    connection = data.get("connection") or {}
-    rows = [
-        ("IP", data.get("ip", str(parsed))),
-        ("Type", data.get("type", "N/A")),
-        ("Country", data.get("country", "N/A")),
-        ("Region", data.get("region", "N/A")),
-        ("City", data.get("city", "N/A")),
-        ("ISP", connection.get("isp", "N/A")),
-        ("Org", connection.get("org", "N/A")),
-        ("ASN", connection.get("asn", "N/A")),
-        ("Timezone", (data.get("timezone") or {}).get("id", "N/A")),
-        ("Source", "ipwho.is (HTTPS, community)"),
-    ]
-    section(f"Geolocation - {parsed}")
-    lines = []
-    for key, value in rows:
-        print(f"  {key:<10}: {value}")
-        lines.append(f"{key}: {value}")
-    return lines
+def http_get_json(url, headers=None, timeout=HTTP_TIMEOUT, read_limit=4 * 1024 * 1024):
+    resp = http_request("GET", url, headers=headers, timeout=timeout, read_limit=read_limit)
+    try:
+        data = json.loads(resp["body"].decode("utf-8", "replace"))
+    except json.JSONDecodeError as exc:
+        raise HTTPError(f"invalid JSON from {url}") from exc
+    return data, resp
 
 
-def _fmt_whois_value(value):
-    if isinstance(value, list):
-        return ", ".join(str(v) for v in value)
-    if isinstance(value, (datetime.date, datetime.datetime)):
-        return value.isoformat()
-    return str(value)
+def _whois_query(server, query, timeout=WHOIS_TIMEOUT):
+    with socket.create_connection((server, 43), timeout=timeout) as sock:
+        sock.settimeout(timeout)
+        sock.sendall((query + "\r\n").encode("ascii", "replace"))
+        data = b""
+        while True:
+            try:
+                chunk = sock.recv(4096)
+            except socket.timeout:
+                break
+            if not chunk:
+                break
+            data += chunk
+            if len(data) > 256 * 1024:
+                break
+    return data.decode("utf-8", "replace")
+
+
+def _whois_referral(text):
+    for line in text.splitlines():
+        low = line.lower()
+        if low.startswith(("refer:", "whois:", "registrar whois server:",
+                           "referralserver:", "whois server:")):
+            value = line.split(":", 1)[1].strip()
+            if value and not any(c.isspace() for c in value) and validate_domain(value):
+                return value
+    return None
 
 
 def whois_lookup(target):
-    whois = _require("whois")
-    if not whois:
-        return None
     kind, value = classify_target(target)
     if kind == "invalid":
-        error(f"Invalid domain or IP: {target}")
-        return None
+        raise ValueError(f"invalid target: {target}")
+    chain = []
+    server = "whois.iana.org"
+    query = value
+    for _ in range(4):
+        try:
+            response = _whois_query(server, query)
+        except OSError as exc:
+            chain.append({"server": server, "error": str(exc)})
+            break
+        chain.append({"server": server, "response": response})
+        referral = _whois_referral(response)
+        if not referral or referral == server:
+            break
+        server = referral
+    return {"target": value, "chain": chain}
+
+
+def tls_fetch_cert(host, port=443, timeout=TLS_TIMEOUT):
+    context = ssl.create_default_context()
+    with socket.create_connection((host, port), timeout=timeout) as sock:
+        with context.wrap_socket(sock, server_hostname=host) as tls:
+            cert = tls.getpeercert()
+            version = tls.version()
+            cipher = tls.cipher()
+    if not cert:
+        raise ssl.SSLError("no certificate returned")
+    return {"cert": cert, "version": version, "cipher": cipher}
+
+
+def port_probe(host, port, timeout=PORT_TIMEOUT):
     try:
-        info("Querying WHOIS...")
-        data = whois.whois(value)
-        if not data:
-            error("No WHOIS data returned.")
-            return None
-        section(f"WHOIS - {value}")
-        collected = {}
-        for key, val in data.items():
-            if val in (None, "", [], {}):
-                continue
-            formatted = _fmt_whois_value(val)
-            collected[key] = formatted
-            print(f"  {key}: {formatted}")
-        if not collected:
-            warning("No usable WHOIS fields.")
-            return None
-        return collected
-    except Exception as exc:
-        error(f"WHOIS lookup failed: {type(exc).__name__}")
-        return None
-
-
-def scan_port(parsed, port, results):
+        parsed = parse_ip(host)
+    except ValueError:
+        return "UNRESOLVED"
     family = socket.AF_INET6 if parsed.version == 6 else socket.AF_INET
     sock = socket.socket(family, socket.SOCK_STREAM)
-    sock.settimeout(PORT_TIMEOUT)
+    sock.settimeout(timeout)
     try:
         rc = sock.connect_ex((str(parsed), port))
         if rc == 0:
-            results[port] = "OPEN"
-        elif rc in {errno.ECONNREFUSED, getattr(errno, "WSAECONNREFUSED", 10061)}:
-            results[port] = "CLOSED"
-        else:
-            results[port] = "UNREACHABLE"
+            return "OPEN"
+        if rc in (61, 111, 10061):
+            return "CLOSED"
+        return "UNREACHABLE"
     except socket.timeout:
-        results[port] = "TIMEOUT"
-    except socket.gaierror:
-        results[port] = "UNRESOLVED"
+        return "TIMEOUT"
     except Exception:
-        results[port] = "ERROR"
+        return "ERROR"
     finally:
+        try: sock.close()
+        except Exception: pass
+
+
+def banner_grab(host, port, timeout=2.0):
+    parsed = parse_ip(host)
+    if not parsed:
+        return None
+    family = socket.AF_INET6 if parsed.version == 6 else socket.AF_INET
+    sock = socket.socket(family, socket.SOCK_STREAM)
+    sock.settimeout(timeout)
+    try:
+        if sock.connect_ex((str(parsed), port)) != 0:
+            return None
+        if port in (80, 8080):
+            try:
+                sock.sendall(f"HEAD / HTTP/1.0\r\nHost: {parsed}\r\n\r\n".encode())
+            except OSError:
+                pass
         try:
-            sock.close()
-        except Exception:
+            data = sock.recv(512)
+        except socket.timeout:
+            return ""
+        return data.decode("utf-8", "replace").strip()
+    finally:
+        try: sock.close()
+        except Exception: pass
+
+
+def _icmp_checksum(payload):
+    if len(payload) % 2:
+        payload += b"\x00"
+    total = 0
+    for i in range(0, len(payload), 2):
+        total += (payload[i] << 8) + payload[i + 1]
+    while total >> 16:
+        total = (total & 0xFFFF) + (total >> 16)
+    return ~total & 0xFFFF
+
+
+def _icmp_echo(ident, seq, payload=b"IP-FINDER"):
+    hdr = struct.pack("!BBHHH", ICMP_ECHO_REQUEST, 0, 0, ident, seq)
+    cs = _icmp_checksum(hdr + payload)
+    return struct.pack("!BBHHH", ICMP_ECHO_REQUEST, 0, cs, ident, seq) + payload
+
+
+def _icmp_parse(raw, expect_id, expect_seq, has_ip_header):
+    offset = 0
+    if has_ip_header:
+        if len(raw) < 20:
+            return None
+        ihl = (raw[0] & 0x0F) * 4
+        if ihl < 20 or ihl > len(raw):
+            return None
+        offset = ihl
+    if len(raw) - offset < 8:
+        return None
+    try:
+        itype, _code, _cs, ident, seq = struct.unpack("!BBHHH", raw[offset:offset + 8])
+    except struct.error:
+        return None
+    if itype == ICMP_ECHO_REPLY and ident == expect_id and seq == expect_seq:
+        return "reply"
+    if itype in (ICMP_TIME_EXCEEDED, ICMP_DEST_UNREACH):
+        inner = offset + 8
+        if len(raw) - inner < 20:
+            return None
+        inner_ihl = (raw[inner] & 0x0F) * 4
+        if inner_ihl < 20 or len(raw) - inner < inner_ihl + 8:
+            return None
+        icmp_off = inner + inner_ihl
+        try:
+            _t, _c, _cs, iid, iseq = struct.unpack("!BBHHH", raw[icmp_off:icmp_off + 8])
+        except struct.error:
+            return None
+        if iid != expect_id or iseq != expect_seq:
+            return None
+        return "hop" if itype == ICMP_TIME_EXCEEDED else "unreachable"
+    return None
+
+
+def _traceroute_icmp(target_ip, max_hops, probes, timeout):
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)
+    except OSError:
+        return None
+    sock.settimeout(timeout)
+    ident = os.getpid() & 0xFFFF
+    has_ip_header = os.name != "nt"
+    hops = []
+    reached = False
+    try:
+        for ttl in range(1, max_hops + 1):
+            sock.setsockopt(socket.IPPROTO_IP, socket.IP_TTL, ttl)
+            samples = []
+            responders = set()
+            for probe in range(probes):
+                seq = (ttl << 8) + probe
+                packet = _icmp_echo(ident, seq)
+                started = time.perf_counter()
+                try:
+                    sock.sendto(packet, (target_ip, 0))
+                except OSError:
+                    samples.append(None)
+                    continue
+                got = None
+                deadline = time.perf_counter() + timeout
+                while time.perf_counter() < deadline:
+                    try:
+                        raw, addr = sock.recvfrom(2048)
+                    except (socket.timeout, OSError):
+                        break
+                    kind = _icmp_parse(raw, ident, seq, has_ip_header)
+                    if kind is None:
+                        continue
+                    elapsed = (time.perf_counter() - started) * 1000
+                    got = (addr[0], elapsed, kind)
+                    responders.add(addr[0])
+                    if kind == "reply":
+                        reached = True
+                    break
+                samples.append(got)
+            hops.append({"ttl": ttl, "responders": responders, "samples": samples})
+            if reached:
+                break
+    finally:
+        try: sock.close()
+        except OSError: pass
+    return hops
+
+
+def _traceroute_tcp(target_ip, port, max_hops, probes, timeout):
+    if not sys.platform.startswith("linux"):
+        return None
+    try:
+        test = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        test.setsockopt(socket.IPPROTO_IP, IP_RECVERR_LINUX, 1)
+        test.close()
+    except OSError:
+        return None
+    hops = []
+    reached = False
+    for ttl in range(1, max_hops + 1):
+        samples = []
+        responders = set()
+        for _probe in range(probes):
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.setsockopt(socket.IPPROTO_IP, socket.IP_TTL, ttl)
+            sock.setsockopt(socket.IPPROTO_IP, IP_RECVERR_LINUX, 1)
+            sock.settimeout(timeout)
+            started = time.perf_counter()
+            outcome = None
+            try:
+                sock.connect((target_ip, port))
+                elapsed = (time.perf_counter() - started) * 1000
+                outcome = (target_ip, elapsed, "reply")
+                responders.add(target_ip)
+                reached = True
+            except OSError as exc:
+                elapsed = (time.perf_counter() - started) * 1000
+                responder = None
+                reason = "unreachable"
+                try:
+                    _data, anc, _f, addr = sock.recvmsg(1024, 1024, MSG_ERRQUEUE_LINUX)
+                except OSError:
+                    anc, addr = [], None
+                for level, ctype, cdata in anc:
+                    if (level == socket.IPPROTO_IP and ctype == IP_RECVERR_LINUX
+                            and len(cdata) >= 16):
+                        try:
+                            (ee_errno, ee_origin, ee_type, ee_code,
+                             _pad, _info, _data) = struct.unpack("IbbbbII", cdata[:16])
+                        except struct.error:
+                            continue
+                        if ee_origin == SO_EE_ORIGIN_ICMP:
+                            if ee_type == ICMP_TIME_EXCEEDED:
+                                reason = "hop"
+                            elif ee_type == ICMP_DEST_UNREACH:
+                                reason = "unreachable"
+                        if len(cdata) >= 32:
+                            try:
+                                fam, _p, addr_bytes, _pad = struct.unpack(
+                                    "<HH4s8s", cdata[16:32])
+                                if fam == socket.AF_INET:
+                                    responder = socket.inet_ntoa(addr_bytes)
+                            except struct.error:
+                                pass
+                if responder is None and addr:
+                    cand = addr[0]
+                    if cand and cand != "0.0.0.0":
+                        responder = cand
+                if responder is None:
+                    outcome = (None, elapsed, type(exc).__name__)
+                else:
+                    outcome = (responder, elapsed, reason)
+                    responders.add(responder)
+            finally:
+                try: sock.close()
+                except OSError: pass
+            samples.append(outcome)
+        hops.append({"ttl": ttl, "responders": responders, "samples": samples})
+        if reached:
+            break
+    return hops
+
+
+_ENRICH_CACHE = {}
+
+
+def _hop_enrichment(ip):
+    if ip in _ENRICH_CACHE:
+        return _ENRICH_CACHE[ip]
+    try:
+        ptr = socket.gethostbyaddr(ip)[0]
+    except (socket.herror, socket.gaierror, OSError):
+        ptr = None
+    asn = None
+    try:
+        with socket.create_connection(("whois.cymru.com", 43), timeout=4) as cs:
+            cs.sendall(f" -v {ip}\r\n".encode())
+            cs.settimeout(4)
+            data = b""
+            while True:
+                try:
+                    chunk = cs.recv(4096)
+                except socket.timeout:
+                    break
+                if not chunk:
+                    break
+                data += chunk
+                if len(data) > 8192:
+                    break
+        for ln in data.decode("utf-8", "replace").splitlines():
+            ln = ln.strip()
+            if not ln or ln.lower().startswith("as "):
+                continue
+            parts = [p.strip() for p in ln.split("|")]
+            if len(parts) >= 7 and parts[0].isdigit():
+                asn = f"AS{parts[0]} {parts[6]}"
+                break
+    except OSError:
+        asn = None
+    _ENRICH_CACHE[ip] = (ptr, asn)
+    return ptr, asn
+
+
+def _traceroute_capability():
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)
+        s.close()
+        return "ICMP raw (elevated)"
+    except OSError:
+        pass
+    if sys.platform.startswith("linux"):
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.setsockopt(socket.IPPROTO_IP, IP_RECVERR_LINUX, 1)
+            s.close()
+            return "TCP-SYN (IP_RECVERR, unprivileged)"
+        except OSError:
             pass
+    return "unavailable"
 
 
-def port_scan(ip):
+def tool_01_public_ip(results):
+    try:
+        resp = http_request("GET", "https://api.ipify.org", read_limit=200)
+        ip = resp["body"].decode("ascii", "replace").strip()
+        if not validate_ip(ip):
+            return emit("Public IP", [("Result", f"invalid response: {ip[:60]}"),
+                                      ("Source", "api.ipify.org")], results)
+        return emit("Public IP", [("Public IP", ip), ("Source", "api.ipify.org")], results)
+    except Exception as exc:
+        return emit("Public IP", [("Error", f"{type(exc).__name__}: {exc}")], results)
+
+
+def tool_02_reverse_dns(ip, results):
     parsed = parse_ip(ip)
     if not parsed:
-        error(f"Invalid IP address: {ip}")
-        return None
-    info(f"Scanning {len(COMMON_PORTS)} common TCP ports on {parsed}...")
-    results = {}
-    threads = []
-    for port in COMMON_PORTS:
-        t = threading.Thread(target=scan_port, args=(parsed, port, results), daemon=True)
-        t.start()
-        threads.append(t)
-    for t in threads:
-        t.join(timeout=3)
-    section(f"Port scan - {parsed}")
-    print(f"  {'Port':<7}{'Service':<14}{'State'}")
-    rows = []
-    for port in sorted(results):
-        st = results[port]
-        color = GREEN if st == "OPEN" else YELLOW if st in ("CLOSED", "TIMEOUT") else RED
-        service = COMMON_PORTS.get(port, "Unknown")
-        print(f"  {port:<7}{service:<14}{color}{st}{RESET}")
-        rows.append(f"{port}/{service}: {st}")
-    return rows
-
-
-def grab_http_headers(target):
-    requests = _require("requests")
-    if not requests:
-        return None
-    url = normalize_url(target)
-    if not url:
-        error("Invalid URL or target. Use a valid domain, IP, or HTTP/HTTPS URL.")
-        return None
-    response = None
+        return emit("Reverse DNS", [("Error", f"invalid IP: {ip}")], results)
+    query = parsed.reverse_pointer
     try:
-        info("Fetching HTTP headers...")
-        response = requests.get(url, timeout=API_TIMEOUT, allow_redirects=True, stream=True,
-                                headers={"User-Agent": f"{TOOL_NAME}/{VERSION}"})
-        section(f"HTTP {response.status_code} - {url}")
-        collected = {"status": str(response.status_code), "url": response.url}
-        for key, value in response.headers.items():
-            print(f"  {key}: {value}")
-            collected[key] = value
-        return collected
-    except requests.exceptions.SSLError:
-        error("TLS error contacting target.")
-    except requests.exceptions.RequestException as exc:
-        error(f"HTTP request failed: {type(exc).__name__}")
-    finally:
-        if response is not None:
-            try:
-                response.close()
-            except Exception:
-                pass
-    return None
+        resp = dns_resolve(query, "PTR")
+    except DNSError as exc:
+        return emit("Reverse DNS", [("Error", str(exc))], results)
+    ptrs = [rr["value"] for rr in resp["answers"] if rr["type"] == 12]
+    if not ptrs:
+        return emit("Reverse DNS", [("Result", "no PTR record"),
+                                    ("Status", resp["rcode_name"])], results)
+    rows = [("PTR", p) for p in ptrs] + [("Query", query), ("Server", resp["server"])]
+    return emit(f"Reverse DNS - {parsed}", rows, results)
 
 
-def _cert_lines(cert):
-    lines = []
-    for key, val in cert.items():
-        if isinstance(val, (list, tuple)):
-            lines.append(f"{key}:")
-            for item in val:
-                if isinstance(item, tuple):
-                    parts = ["=".join(map(str, sub)) if isinstance(sub, tuple) else str(sub)
-                             for sub in item]
-                    lines.append(f"  {', '.join(parts)}")
-                else:
-                    lines.append(f"  {item}")
+def tool_03_domain_to_ip(domain, results):
+    if not validate_domain(domain):
+        return emit("Domain to IP", [("Error", f"invalid domain: {domain}")], results)
+    rows = []
+    for rtype in ("A", "AAAA"):
+        try:
+            resp = dns_resolve(domain, rtype)
+            addrs = [rr["value"] for rr in resp["answers"] if rr["type"] == DNS_TYPE_CODES[rtype]]
+            if addrs:
+                rows.extend((rtype, a) for a in addrs)
+            else:
+                rows.append((rtype, f"none ({resp['rcode_name']})"))
+        except DNSError as exc:
+            rows.append((rtype, f"error: {exc}"))
+    return emit(f"Domain to IP - {domain}", rows, results)
+
+
+def tool_04_dns_records(domain, results):
+    if not validate_domain(domain):
+        return emit("DNS Records", [("Error", f"invalid domain: {domain}")], results)
+    rows = []
+    for rtype in DNS_RECORD_TYPES:
+        try:
+            resp = dns_resolve(domain, rtype)
+        except DNSError as exc:
+            rows.append((rtype, f"error: {exc}"))
+            continue
+        if resp["rcode"] == 3:
+            rows.append((rtype, "NXDOMAIN"))
+            break
+        matches = [rr for rr in resp["answers"]
+                   if rr["type"] == DNS_TYPE_CODES[rtype]]
+        if matches:
+            for rr in matches:
+                rows.append((rtype, f"{rr['value']}  (TTL {rr['ttl']})"))
         else:
-            lines.append(f"{key}: {val}")
-    return lines
+            rows.append((rtype, f"none ({resp['rcode_name']})"))
+    return emit(f"DNS Records - {domain}", rows, results)
 
 
-def grab_https_cert(target):
+def tool_05_geoip(ip, results):
+    parsed = parse_ip(ip)
+    if not parsed:
+        return emit("GeoIP", [("Error", f"invalid IP: {ip}")], results)
+    try:
+        data, _ = http_get_json(f"https://ipwho.is/{parsed}")
+    except Exception as exc:
+        return emit("GeoIP", [("Error", f"{type(exc).__name__}: {exc}")], results)
+    if not data.get("success"):
+        return emit("GeoIP", [("Error", data.get("message", "unknown"))], results)
+    conn = data.get("connection") or {}
+    rows = [
+        ("IP", data.get("ip", str(parsed))),
+        ("Type", data.get("type", "?")),
+        ("Country", data.get("country", "?")),
+        ("Region", data.get("region", "?")),
+        ("City", data.get("city", "?")),
+        ("ISP", conn.get("isp", "?")),
+        ("Organization", conn.get("org", "?")),
+        ("ASN", conn.get("asn", "?")),
+        ("Timezone", (data.get("timezone") or {}).get("id", "?")),
+        ("Source", "ipwho.is (HTTPS)"),
+    ]
+    return emit(f"GeoIP - {parsed}", rows, results)
+
+
+def tool_06_whois(target, results):
     kind, value = classify_target(target)
     if kind == "invalid":
-        error(f"Invalid domain or IP: {target}")
-        return None
+        return emit("WHOIS", [("Error", f"invalid target: {target}")], results)
     try:
-        info(f"TLS handshake with {value}:443...")
-        context = ssl.create_default_context()
-        with socket.create_connection((value, 443), timeout=API_TIMEOUT) as sock:
-            with context.wrap_socket(sock, server_hostname=value) as ssock:
-                cert = ssock.getpeercert()
-                if not cert:
-                    error("No certificate returned.")
-                    return None
-                section(f"TLS certificate - {value}")
-                lines = _cert_lines(cert)
-                for line in lines:
-                    print(f"  {line}")
-                return lines
-    except ssl.SSLCertVerificationError as exc:
-        error(f"Certificate verification failed: {exc.reason if hasattr(exc, 'reason') else exc}")
-    except socket.timeout:
-        error("TLS handshake timed out.")
-    except socket.gaierror:
-        error("DNS resolution failed for TLS target.")
-    except ssl.SSLError as exc:
-        error(f"TLS error: {exc}")
+        result = whois_lookup(value)
     except Exception as exc:
-        error(f"Certificate retrieval failed: {type(exc).__name__}")
-    return None
+        return emit("WHOIS", [("Error", f"{type(exc).__name__}: {exc}")], results)
+    rows = [("Target", value)]
+    for hop in result["chain"]:
+        if "error" in hop:
+            rows.append((f"{hop['server']}!", hop["error"]))
+            continue
+        rows.append((hop["server"], f"{len(hop['response'])} chars"))
+        interesting = []
+        for line in hop["response"].splitlines():
+            ll = line.lower()
+            if any(ll.startswith(k) for k in (
+                    "domain name:", "registrar:", "creation date:", "expiry date:",
+                    "updated date:", "name server:", "netname:", "org-name:",
+                    "country:", "descr:", "inetnum:", "inet6num:", "regdate:")):
+                interesting.append(line.strip())
+        rows.extend(("", x) for x in interesting[:10])
+    return emit(f"WHOIS - {value}", rows, results)
 
 
-def subdomain_enum(domain):
+def tool_07_port_scan(ip, results):
+    parsed = parse_ip(ip)
+    if not parsed:
+        return emit("Port Scan", [("Error", f"invalid IP: {ip}")], results)
+    rows = []
+    info(f"probing {len(COMMON_PORTS)} ports on {parsed}")
+    for port, service in COMMON_PORTS.items():
+        state = port_probe(str(parsed), port)
+        rows.append((f"{port}/{service}", state))
+    return emit(f"Port Scan - {parsed}", rows, results)
+
+
+def tool_08_http_headers(target, results):
+    url = normalize_url(target)
+    if not url:
+        return emit("HTTP Headers", [("Error", f"invalid URL: {target}")], results)
+    try:
+        resp = http_request("GET", url, read_limit=1024)
+    except Exception as exc:
+        return emit("HTTP Headers", [("Error", f"{type(exc).__name__}: {exc}")], results)
+    rows = [("Status", f"{resp['status']} {resp['reason']}"),
+            ("Final URL", resp["url"]),
+            ("Elapsed", f"{resp['elapsed_ms']:.1f} ms")]
+    for k, vals in resp["headers"].items():
+        for v in vals:
+            rows.append((k, v))
+    return emit(f"HTTP Headers - {url}", rows, results)
+
+
+def tool_09_tls_cert(target, results):
+    kind, value = classify_target(target)
+    if kind == "invalid":
+        return emit("TLS Certificate", [("Error", f"invalid target: {target}")], results)
+    host = value
+    if kind == "ip":
+        return emit("TLS Certificate",
+                    [("Error", "certificate inspection requires a hostname (SNI)")], results)
+    try:
+        info(f"TLS handshake with {host}:443")
+        cert_info = tls_fetch_cert(host)
+    except Exception as exc:
+        return emit("TLS Certificate", [("Error", f"{type(exc).__name__}: {exc}")], results)
+    cert = cert_info["cert"]
+    subject = dict(item[0] for item in cert.get("subject", ()))
+    issuer = dict(item[0] for item in cert.get("issuer", ()))
+    san = cert.get("subjectAltName", ())
+    rows = [
+        ("Subject CN", subject.get("commonName", "?")),
+        ("Issuer", issuer.get("organizationName", issuer.get("commonName", "?"))),
+        ("notBefore", cert.get("notBefore", "?")),
+        ("notAfter", cert.get("notAfter", "?")),
+        ("Protocol", cert_info["version"] or "?"),
+        ("Cipher", cert_info["cipher"][0] if cert_info["cipher"] else "?"),
+    ]
+    dns_sans = [v for t, v in san if t == "DNS"]
+    if dns_sans:
+        rows.append(("SANs", f"{len(dns_sans)} DNS names"))
+        rows.extend(("", s) for s in dns_sans[:10])
+    return emit(f"TLS Certificate - {host}", rows, results)
+
+
+def tool_10_subdomains(domain, results):
     if not validate_domain(domain):
-        error(f"Invalid domain: {domain}")
-        return None
-    info(f"Probing {len(COMMON_SUBDOMAINS)} common subdomains...")
-    found = []
+        return emit("Subdomains", [("Error", f"invalid domain: {domain}")], results)
+    rows = []
+    found = 0
     for sub in COMMON_SUBDOMAINS:
         fqdn = f"{sub}.{domain}"
         try:
-            ip = socket.gethostbyname(fqdn)
-        except (socket.gaierror, socket.herror):
+            resp = dns_resolve(fqdn, "A")
+            addrs = [rr["value"] for rr in resp["answers"] if rr["type"] == 1]
+        except DNSError:
             continue
-        except Exception:
-            continue
-        success(f"{GREEN}{fqdn}{RESET} -> {ip}")
-        found.append(f"{fqdn} -> {ip}")
+        if addrs:
+            rows.append((fqdn, ", ".join(addrs)))
+            found += 1
     if not found:
-        warning("No common subdomains found.")
-        return []
-    return found
+        rows.append(("Result", "no common subdomains found"))
+    return emit(f"Subdomains - {domain}", rows, results)
 
 
-def asn_lookup(target):
+def tool_11_asn(target, results):
     kind, value = classify_target(target)
     if kind == "invalid":
-        error(f"Invalid IP or domain: {target}")
-        return None
+        return emit("ASN / ISP", [("Error", f"invalid target: {target}")], results)
     if kind == "domain":
         try:
-            value = socket.gethostbyname(value)
-        except socket.gaierror:
-            error("Domain did not resolve to an IP.")
-            return None
-    parsed = parse_ip(value)
-    if not parsed:
-        error("Target is not a valid IP.")
-        return None
-    info("Querying ASN registry (ipwho.is, HTTPS)...")
-    data, err = http_get_json(f"https://ipwho.is/{parsed}")
-    if err:
-        error(f"ASN lookup failed: {err}")
-        return None
-    if not data or not data.get("success", False):
-        error(f"ASN error: {data.get('message', 'unknown') if data else 'no data'}")
-        return None
+            resp = dns_resolve(value, "A")
+            addrs = [rr["value"] for rr in resp["answers"] if rr["type"] == 1]
+            if not addrs:
+                return emit("ASN / ISP", [("Error", f"{value} did not resolve")], results)
+            value = addrs[0]
+        except DNSError as exc:
+            return emit("ASN / ISP", [("Error", str(exc))], results)
+    try:
+        data, _ = http_get_json(f"https://ipwho.is/{value}")
+    except Exception as exc:
+        return emit("ASN / ISP", [("Error", f"{type(exc).__name__}: {exc}")], results)
+    if not data.get("success"):
+        return emit("ASN / ISP", [("Error", data.get("message", "unknown"))], results)
     conn = data.get("connection") or {}
-    asn_num = conn.get("asn", "N/A")
-    asn_org = conn.get("org", "N/A")
-    isp = conn.get("isp", "N/A")
-    section(f"ASN / ISP - {parsed}")
+    asn = conn.get("asn", "?")
     rows = [
-        ("IP", data.get("ip", str(parsed))),
-        ("ISP", isp),
-        ("Organization", asn_org),
-        ("ASN", (str(asn_num) if str(asn_num).upper().startswith("AS") else f"AS{asn_num}")
-         if asn_num != "N/A" else "N/A"),
-        ("AS org", asn_org),
-        ("Source", "ipwho.is (HTTPS, community)"),
+        ("IP", data.get("ip", value)),
+        ("ISP", conn.get("isp", "?")),
+        ("Organization", conn.get("org", "?")),
+        ("ASN", f"AS{asn}" if asn != "?" and not str(asn).upper().startswith("AS") else asn),
+        ("Source", "ipwho.is (HTTPS)"),
     ]
-    lines = []
-    for key, val in rows:
-        print(f"  {key:<14}: {val}")
-        lines.append(f"{key}: {val}")
-    return lines
+    return emit(f"ASN / ISP - {value}", rows, results)
 
 
-def rdap_lookup(target):
+def tool_12_rdap(target, results):
     kind, value = classify_target(target)
     if kind == "invalid":
-        error(f"Invalid IP or domain: {target}")
-        return None
-    if kind == "ip":
-        url = f"https://rdap.org/ip/{parse_ip(value)}"
-    else:
-        url = f"https://rdap.org/domain/{value}"
-    info(f"Querying RDAP at rdap.org for {value}...")
-    data, err = http_get_json(url, accept="application/rdap+json")
-    rdap_subject = value
-    used_parent_fallback = False
-    if kind == "domain" and err and "404" in err:
-        labels = value.split(".")
-        if len(labels) >= 3:
-            parent = ".".join(labels[1:])
-            parent_url = f"https://rdap.org/domain/{parent}"
-            info(f"No RDAP object for host; trying parent domain {parent}...")
-            parent_data, parent_err = http_get_json(parent_url, accept="application/rdap+json")
-            if not parent_err and isinstance(parent_data, dict):
-                data, err = parent_data, None
-                rdap_subject = parent
-                used_parent_fallback = True
-            else:
-                err = f"host lookup: {err}; parent ({parent}): {parent_err}"
-    if err:
-        error(f"RDAP request failed: {err}")
-        return None
-    if not isinstance(data, dict):
-        error("RDAP response was not a JSON object.")
-        return None
-    section(f"RDAP - {rdap_subject}")
-    lines = []
-    if used_parent_fallback:
-        note = f"Requested host: {value} (showing parent-domain RDAP for {rdap_subject})"
-        print(f"  Note         : {note}")
-        lines.append(note)
+        return emit("RDAP", [("Error", f"invalid target: {target}")], results)
+    url = f"https://rdap.org/ip/{value}" if kind == "ip" else f"https://rdap.org/domain/{value}"
+    try:
+        data, _ = http_get_json(url, headers={"Accept": "application/rdap+json"})
+    except Exception as exc:
+        return emit("RDAP", [("Error", f"{type(exc).__name__}: {exc}")], results)
+    rows = [("Target", value)]
     for field in ("name", "handle", "type", "country"):
         if data.get(field):
-            print(f"  {field.capitalize():<13}: {data[field]}")
-            lines.append(f"{field}: {data[field]}")
+            rows.append((field.capitalize(), data[field]))
     for entity in data.get("entities", []) or []:
         roles = ", ".join(entity.get("roles", []))
-        vcard = (entity.get("vcardArray") or [None, []])[1]
-        for entry in vcard:
+        for entry in (entity.get("vcardArray") or [None, []])[1]:
             if entry and entry[0] == "fn":
-                print(f"  Entity       : {entry[3]} ({roles})")
-                lines.append(f"Entity: {entry[3]} ({roles})")
+                rows.append(("Entity", f"{entry[3]} ({roles})"))
                 break
-    for event in data.get("events", []) or []:
-        action = event.get("eventAction", "")
-        when = event.get("eventDate", "")
+    for ev in data.get("events", []) or []:
+        action = ev.get("eventAction", "")
         if action in ("registration", "expiration", "last changed"):
-            print(f"  {action.capitalize():<13}: {when}")
-            lines.append(f"{action}: {when}")
+            rows.append((action.capitalize(), ev.get("eventDate", "?")))
     statuses = data.get("status") or []
     if statuses:
-        print(f"  Status       : {', '.join(statuses)}")
-        lines.append(f"Status: {', '.join(statuses)}")
-    nameservers = data.get("nameservers") or []
-    if nameservers:
-        ns_list = [ns.get("ldhName", "?") for ns in nameservers]
-        print(f"  Nameservers  : {', '.join(ns_list)}")
-        lines.append(f"Nameservers: {', '.join(ns_list)}")
-    if not lines:
-        warning("RDAP returned no usable fields.")
-        return None
-    return lines
+        rows.append(("Status", ", ".join(statuses)))
+    ns_list = [ns.get("ldhName", "?") for ns in (data.get("nameservers") or [])]
+    if ns_list:
+        rows.append(("Nameservers", ", ".join(ns_list)))
+    return emit(f"RDAP - {value}", rows, results)
 
 
-def _query_resolver(resolver_ip, domain, rtype, results):
-    if not _dns:
-        return
-    import dns.resolver
-    try:
-        res = dns.resolver.Resolver(configure=False)
-        res.nameservers = [resolver_ip]
-        res.lifetime = DNS_TIMEOUT
-        res.timeout = DNS_TIMEOUT
-        answers = res.resolve(domain, rtype, lifetime=DNS_TIMEOUT)
-        results[resolver_ip] = sorted(rdata.to_text() for rdata in answers)
-    except dns.resolver.NoAnswer:
-        results[resolver_ip] = []
-    except dns.resolver.NXDOMAIN:
-        results[resolver_ip] = "NXDOMAIN"
-    except dns.resolver.LifetimeTimeout:
-        results[resolver_ip] = "TIMEOUT"
-    except Exception as exc:
-        results[resolver_ip] = f"ERROR:{type(exc).__name__}"
-
-
-def dns_propagation_check(domain, rtype):
-    dns = _require("dns")
-    if not dns:
-        return None
+def tool_13_propagation(domain, rtype, results):
     if not validate_domain(domain):
-        error(f"Invalid domain: {domain}")
-        return None
-    rtype = (rtype or "").upper().strip()
-    if rtype not in PROPAGATION_TYPES:
-        error(f"Unsupported record type: {rtype}. Use: {', '.join(PROPAGATION_TYPES)}")
-        return None
-    results = {}
-    threads = []
-    info(f"Querying {len(PUBLIC_RESOLVERS)} resolvers for {domain} {rtype}...")
-    for _name, ip in PUBLIC_RESOLVERS:
-        t = threading.Thread(target=_query_resolver, args=(ip, domain, rtype, results), daemon=True)
-        t.start()
-        threads.append(t)
-    for t in threads:
-        t.join(timeout=DNS_TIMEOUT + 2)
-    section(f"DNS propagation - {domain} {rtype}")
-    print(f"  {'Resolver':<12}{'Address':<18}{'Answer'}")
-    lines = []
-    for label, ip in PUBLIC_RESOLVERS:
-        ans = results.get(ip, "NO RESPONSE")
-        text = ", ".join(ans) if isinstance(ans, list) and ans else "(empty)" if isinstance(ans, list) else str(ans)
-        print(f"  {label:<12}{ip:<18}{text}")
-        lines.append(f"{label} ({ip}): {text}")
-    lists = [v for v in results.values() if isinstance(v, list)]
-    if len(lists) > 1:
-        normalized = {tuple(sorted(v)) for v in lists}
-        if len(normalized) > 1:
-            warning("ANSWERS DIFFER between resolvers.")
-            lines.append("STATUS: answers differ")
+        return emit("DNS Propagation", [("Error", f"invalid domain: {domain}")], results)
+    rtype = (rtype or "A").upper()
+    if rtype not in DNS_RECORD_TYPES:
+        return emit("DNS Propagation", [("Error", f"unsupported type: {rtype}")], results)
+    rows = []
+    results_by_server = {}
+    for label, server in PUBLIC_RESOLVERS:
+        try:
+            resp = dns_resolve(domain, rtype, server=server)
+            vals = sorted(rr["value"] for rr in resp["answers"]
+                          if rr["type"] == DNS_TYPE_CODES[rtype])
+            results_by_server[label] = vals
+            rows.append((f"{label} ({server})", ", ".join(vals) if vals else f"none ({resp['rcode_name']})"))
+        except DNSError as exc:
+            results_by_server[label] = None
+            rows.append((f"{label} ({server})", f"error: {exc}"))
+    usable = [tuple(v) for v in results_by_server.values() if v is not None]
+    if len(usable) >= 2:
+        if len(set(usable)) == 1:
+            rows.append(("Verdict", "all responders agree"))
         else:
-            success("All responding resolvers agree.")
-            lines.append("STATUS: consistent")
+            rows.append(("Verdict", "ANSWERS DIFFER between resolvers"))
     else:
-        warning("Insufficient responses to compare.")
-        lines.append("STATUS: insufficient responses")
-    return lines
+        rows.append(("Verdict", "insufficient responses"))
+    return emit(f"DNS Propagation - {domain} {rtype}", rows, results)
 
 
-def dnssec_check(domain):
-    dns = _require("dns")
-    if not dns:
-        return None
+def tool_14_dnssec(domain, results):
     if not validate_domain(domain):
-        error(f"Invalid domain: {domain}")
-        return None
-    import dns.resolver
-    info("Querying DNSSEC records (DS, DNSKEY, RRSIG)...")
-    records = {}
+        return emit("DNSSEC", [("Error", f"invalid domain: {domain}")], results)
+    rows = []
+    states = {}
     for rtype in ("DS", "DNSKEY", "RRSIG"):
         try:
-            ans = dns.resolver.resolve(domain, rtype, lifetime=DNS_TIMEOUT)
-            records[rtype] = [rdata.to_text() for rdata in ans]
-        except dns.resolver.NoAnswer:
-            records[rtype] = []
-        except dns.resolver.NXDOMAIN:
-            records[rtype] = []
-            break
-        except dns.resolver.LifetimeTimeout:
-            records[rtype] = "TIMEOUT"
-        except Exception:
-            records[rtype] = "ERROR"
-    section(f"DNSSEC - {domain}")
-    lines = []
-    for rtype, value in records.items():
-        if isinstance(value, list):
-            state = f"{len(value)} record(s)" if value else "none"
-        else:
-            state = value
-        print(f"  {rtype:<8}: {state}")
-        lines.append(f"{rtype}: {state}")
-    ds = records.get("DS") or []
-    dnskey = records.get("DNSKEY") or []
-    rrsig = records.get("RRSIG") or []
-    if isinstance(ds, list) and isinstance(dnskey, list):
-        if not ds and not dnskey:
-            print("  Status   : DNSSEC not configured")
-            lines.append("Status: not configured")
-        elif ds and dnskey:
-            print("  Status   : DNSSEC configured (records present)")
-            print("  Validated: no - full chain validation not performed")
-            lines.append("Status: configured (records present, NOT validated)")
-            warning("Presence of DS/DNSKEY does not prove cryptographic validity.")
-        else:
-            print("  Status   : partial/inconsistent")
-            lines.append("Status: partial DNSSEC data")
-            warning("Partial DNSSEC records - configuration may be broken.")
-    if rrsig:
-        section(f"RRSIG sample ({len(rrsig)} records)")
-        for rec in rrsig[:3]:
-            print(f"  {rec[:100]}{'...' if len(rec) > 100 else ''}")
-    return lines
+            resp = dns_resolve(domain, rtype, edns_do=True)
+            matched = [rr for rr in resp["answers"] if rr["type"] == DNS_TYPE_CODES[rtype]]
+            states[rtype] = matched
+            rows.append((rtype, f"{len(matched)} record(s)" if matched else "none"))
+        except DNSError as exc:
+            states[rtype] = []
+            rows.append((rtype, f"error: {exc}"))
+    ds = states.get("DS", [])
+    dnskey = states.get("DNSKEY", [])
+    if not ds and not dnskey:
+        rows.append(("Status", "DNSSEC not configured"))
+    elif ds and dnskey:
+        rows.append(("Status", "records present (NOT validated)"))
+        rows.append(("Validate", "requires a validating resolver — this tool does not chain-validate"))
+    else:
+        rows.append(("Status", "partial / inconsistent DNSSEC data"))
+    return emit(f"DNSSEC - {domain}", rows, results)
 
 
-def subnet_calculator(cidr):
+def tool_15_subnet(cidr, results):
     try:
         net = ipaddress.ip_network(cidr, strict=False)
     except (ValueError, TypeError):
-        error(f"Invalid CIDR: {cidr}")
-        return None
-    section(f"Subnet - {net}")
-    lines = [
-        f"Version          : IPv{net.version}",
-        f"Network address  : {net.network_address}",
-        f"Prefix length    : /{net.prefixlen}",
-        f"Total addresses  : {net.num_addresses}",
+        return emit("Subnet Calculator", [("Error", f"invalid CIDR: {cidr}")], results)
+    rows = [
+        ("Version", f"IPv{net.version}"),
+        ("Network", str(net.network_address)),
+        ("Prefix", f"/{net.prefixlen}"),
+        ("Total addresses", str(net.num_addresses)),
     ]
     if net.version == 4:
-        lines.append(f"Netmask          : {net.netmask}")
-        lines.append(f"Wildcard mask    : {net.hostmask}")
-        lines.append(f"Broadcast        : {net.broadcast_address}")
+        rows.append(("Netmask", str(net.netmask)))
+        rows.append(("Wildcard", str(net.hostmask)))
+        rows.append(("Broadcast", str(net.broadcast_address)))
         if net.prefixlen <= 30:
-            first = net.network_address + 1
-            last = net.broadcast_address - 1
-            lines.append(f"First usable     : {first}")
-            lines.append(f"Last usable      : {last}")
-            lines.append(f"Usable hosts     : {net.num_addresses - 2}")
+            rows.append(("First usable", str(net.network_address + 1)))
+            rows.append(("Last usable", str(net.broadcast_address - 1)))
+            rows.append(("Usable hosts", str(net.num_addresses - 2)))
         elif net.prefixlen == 31:
-            lines.append(f"First usable     : {net.network_address}")
-            lines.append(f"Last usable      : {net.broadcast_address}")
-            lines.append("Note             : /31 point-to-point (RFC 3021)")
+            rows.append(("Note", "/31 point-to-point (RFC 3021)"))
         else:
-            lines.append(f"Host address     : {net.network_address}")
-            lines.append("Note             : /32 single host")
+            rows.append(("Note", "/32 single host"))
     else:
         if net.prefixlen <= 127:
-            lines.append(f"First address    : {net.network_address + 1}")
-            lines.append(f"Last address     : {net.broadcast_address - 1}")
-    for ln in lines:
-        print(f"  {ln}")
-    return lines
+            rows.append(("First address", str(net.network_address + 1)))
+            rows.append(("Last address", str(net.broadcast_address - 1)))
+    return emit(f"Subnet - {net}", rows, results)
 
 
-def ip_reputation_check(target):
-    parsed = parse_ip((target or "").strip())
+def tool_16_ip_reputation(ip, results):
+    parsed = parse_ip(ip)
     if not parsed or not parsed.is_global:
-        error("Enter a valid public IP address for reputation lookup.")
-        return None
-    requests = _require("requests")
-    if not requests:
-        return None
+        return emit("IP Reputation", [("Error", "requires a public IP")], results)
     try:
-        response = requests.get(
+        data, _ = http_get_json(
             f"https://ipaddress.to/api/score/{parsed}",
-            headers={"Accept": "application/json", "User-Agent": f"{TOOL_NAME}/{VERSION}"},
-            timeout=API_TIMEOUT,
-        )
-        response.raise_for_status()
-        payload = response.json()
-        if not isinstance(payload, dict) or not payload.get("success"):
-            reason = payload.get("error", "The reputation service did not return a result") \
-                if isinstance(payload, dict) else "Invalid response from reputation service"
-            error(f"Reputation lookup failed: {reason}")
-            return [f"Lookup error: {reason}"]
-        score = payload.get("score", "N/A")
-        risk = payload.get("risk", "unknown")
-        location = payload.get("location") or {}
-        asn = payload.get("asn") or {}
-        checks = payload.get("checks") or {}
-        lines = [
-            f"IP: {payload.get('ip', parsed)}",
-            f"Risk score: {score}/100 (provider estimate)",
-            f"Risk level: {str(risk).upper()}",
-            f"Country: {location.get('country', 'N/A')}",
-            f"City: {location.get('city', 'N/A')}",
-            f"ASN / Organization: {asn.get('asn', 'N/A')} / {asn.get('org', 'N/A')}",
-            f"VPN detected: {checks.get('vpn_detected', 'N/A')}",
-            f"Proxy detected: {checks.get('commercial_proxy', 'N/A')}",
-            f"Tor exit: {checks.get('tor_exit', 'N/A')}",
-            f"Listed on blocklist: {checks.get('blocklist_listed', 'N/A')}",
-            f"Blocklist count: {checks.get('blocklist_count', 'N/A')}",
-            "Source: IPAddress.to; results are estimates, may be incomplete.",
-        ]
-        section(f"IP reputation - {parsed}")
-        for line in lines:
-            print("  " + line)
-        return lines
+            headers={"Accept": "application/json"})
     except Exception as exc:
-        error(f"Reputation lookup failed: {type(exc).__name__}")
-        return [f"Lookup error: {type(exc).__name__}"]
+        return emit("IP Reputation", [("Error", f"{type(exc).__name__}: {exc}")], results)
+    if not data.get("success"):
+        return emit("IP Reputation", [("Error", data.get("error", "service error"))], results)
+    checks = data.get("checks") or {}
+    rows = [
+        ("IP", data.get("ip", str(parsed))),
+        ("Score", f"{data.get('score', '?')}/100"),
+        ("Risk", str(data.get("risk", "?")).upper()),
+        ("VPN", checks.get("vpn_detected", "?")),
+        ("Proxy", checks.get("commercial_proxy", "?")),
+        ("Tor", checks.get("tor_exit", "?")),
+        ("Blocklisted", checks.get("blocklist_listed", "?")),
+        ("Source", "ipaddress.to"),
+    ]
+    return emit(f"IP Reputation - {parsed}", rows, results)
 
 
-def email_domain_security(domain, dkim_selector=None):
-    dns = _require("dns")
-    if not dns:
-        return None
+def _dns_txt(name):
+    resp = dns_resolve(name, "TXT")
+    return [rr["value"] for rr in resp["answers"] if rr["type"] == 16]
+
+
+def tool_17_email_security(domain, dkim_selector, results):
     if not validate_domain(domain):
-        error(f"Invalid domain: {domain}")
-        return None
-    import dns.resolver
-    domain = domain.rstrip(".").encode("idna").decode("ascii").lower()
-    queries = [("MX", domain, "MX"), ("SPF", domain, "TXT"), ("DMARC", f"_dmarc.{domain}", "TXT")]
+        return emit("Email Security", [("Error", f"invalid domain: {domain}")], results)
+    rows = []
+    try:
+        mx_resp = dns_resolve(domain, "MX")
+        mx = [rr["value"] for rr in mx_resp["answers"] if rr["type"] == 15]
+        rows.append(("MX", f"{len(mx)} record(s)"))
+        rows.extend(("", m) for m in mx[:5])
+    except DNSError as exc:
+        rows.append(("MX", f"error: {exc}"))
+    try:
+        txts = _dns_txt(domain)
+        spf = [t for t in txts if t.lower().startswith("v=spf1")]
+        rows.append(("SPF", spf[0] if spf else "not found"))
+        if len(spf) > 1:
+            rows.append(("SPF warning", "multiple SPF records"))
+    except DNSError as exc:
+        rows.append(("SPF", f"error: {exc}"))
+    try:
+        dmarc = [t for t in _dns_txt(f"_dmarc.{domain}") if "v=dmarc1" in t.lower()]
+        rows.append(("DMARC", dmarc[0] if dmarc else "not found"))
+    except DNSError as exc:
+        rows.append(("DMARC", f"error: {exc}"))
     if dkim_selector:
         if not re.fullmatch(r"[A-Za-z0-9_-]{1,63}", dkim_selector):
-            error("Invalid DKIM selector.")
-            return None
-        queries.append(("DKIM", f"{dkim_selector}._domainkey.{domain}", "TXT"))
-    lines = []
-    section(f"Email domain security - {domain}")
-    for label, name, rtype in queries:
-        try:
-            answer = dns.resolver.resolve(name, rtype, lifetime=DNS_TIMEOUT)
-            records = [r.to_text().strip('"') for r in answer]
-            if label == "SPF":
-                spf = [r for r in records if r.lower().startswith("v=spf1")]
-                if not spf:
-                    state = "No SPF record found"
-                elif len(spf) > 1:
-                    state = "WARNING: multiple SPF records"
-                else:
-                    state = spf[0]
-            else:
-                state = "; ".join(records) if records else "No records found"
-            lines.append(f"{label}: {state}")
-        except dns.resolver.NXDOMAIN:
-            lines.append(f"{label}: domain/name does not exist")
-        except dns.resolver.NoAnswer:
-            lines.append(f"{label}: no records found")
-        except dns.resolver.LifetimeTimeout:
-            lines.append(f"{label}: timeout (unknown, not confirmed missing)")
-        except Exception as exc:
-            lines.append(f"{label}: lookup error ({type(exc).__name__})")
-    for line in lines:
-        print("  " + line)
-    print("  Note: basic DNS configuration check, not a full security audit.")
-    lines.append("Note: basic DNS inspection only.")
-    return lines
-
-
-def http_response_diagnostics(target):
-    requests = _require("requests")
-    if not requests:
-        return None
-    url = normalize_url(target)
-    if not url:
-        error("Invalid URL. Only valid HTTP/HTTPS URLs are accepted.")
-        return None
-    parsed = urlparse(url)
-    if parsed.hostname and (parsed.hostname.lower() == "localhost"
-                            or parsed.hostname.endswith(".localhost")):
-        error("Localhost targets are not supported by this diagnostic.")
-        return None
-    start = time.monotonic()
-    response = None
-    try:
-        response = requests.get(url, timeout=API_TIMEOUT, allow_redirects=True, stream=True,
-                                headers={"User-Agent": f"{TOOL_NAME}/{VERSION}"})
-        try:
-            sample = response.raw.read(1024, decode_content=True) if getattr(response, "raw", None) else b""
-            del sample
-        except Exception:
-            pass
-        elapsed = time.monotonic() - start
-        lines = [
-            f"Final status: {response.status_code}",
-            f"Final URL: {response.url}",
-            f"Redirect count: {len(response.history)}",
-            f"Response time: {elapsed:.3f}s",
-            f"Content-Type: {response.headers.get('Content-Type', 'N/A')}",
-            f"HTTPS used: {'yes' if urlparse(response.url).scheme == 'https' else 'no'}",
-        ]
-        for index, prior in enumerate(response.history, 1):
-            lines.append(f"Redirect {index}: {prior.status_code} -> {prior.headers.get('Location', 'N/A')}")
-        for key in ("Server", "Strict-Transport-Security", "Content-Security-Policy",
-                    "X-Content-Type-Options", "X-Frame-Options"):
-            if key in response.headers:
-                lines.append(f"{key}: {response.headers[key]}")
-        section("HTTP response diagnostics")
-        for line in lines:
-            print("  " + line)
-        return lines
-    except Exception as exc:
-        error(f"HTTP diagnostics failed: {type(exc).__name__}")
-        return [f"HTTP diagnostics error: {type(exc).__name__}"]
-    finally:
-        if response is not None:
+            rows.append(("DKIM", "invalid selector"))
+        else:
             try:
-                response.close()
-            except Exception:
-                pass
+                recs = _dns_txt(f"{dkim_selector}._domainkey.{domain}")
+                rows.append(("DKIM", recs[0] if recs else "not found"))
+            except DNSError as exc:
+                rows.append(("DKIM", f"error: {exc}"))
+    return emit(f"Email Security - {domain}", rows, results)
 
 
-def local_network_information():
-    lines = [f"Hostname: {socket.gethostname()}"]
-    addresses = set()
+def tool_18_http_diag(url, results):
+    url = normalize_url(url)
+    if not url:
+        return emit("HTTP Diagnostics", [("Error", f"invalid URL: {url}")], results)
+    try:
+        resp = http_request("GET", url, read_limit=2048)
+    except Exception as exc:
+        return emit("HTTP Diagnostics", [("Error", f"{type(exc).__name__}: {exc}")], results)
+    rows = [
+        ("Status", f"{resp['status']} {resp['reason']}"),
+        ("Final URL", resp["url"]),
+        ("Elapsed", f"{resp['elapsed_ms']:.1f} ms"),
+        ("Redirects", str(len(resp["history"]))),
+        ("Content-Type", resp["headers"].get("content-type", ["?"])[0]),
+    ]
+    for h in resp["history"]:
+        rows.append((f"{h['status']}", f"{h['url']} -> {h['location']}"))
+    for key in ("server", "strict-transport-security", "content-security-policy"):
+        if key in resp["headers"]:
+            rows.append((key, resp["headers"][key][0]))
+    return emit(f"HTTP Diagnostics - {url}", rows, results)
+
+
+def tool_19_local_network(results):
+    rows = [("Hostname", socket.gethostname())]
+    addrs = set()
     try:
         for item in socket.getaddrinfo(socket.gethostname(), None):
-            address = item[4][0].split("%", 1)[0]
-            if address and not address.startswith("127.") and address != "::1":
-                addresses.add(address)
+            addr = item[4][0].split("%")[0]
+            if addr and not addr.startswith("127.") and addr != "::1":
+                addrs.add(addr)
     except OSError:
         pass
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
-            sock.connect(("192.0.2.1", 80))
-            candidate = sock.getsockname()[0]
-            if candidate and not candidate.startswith("127."):
-                addresses.add(candidate)
-    except OSError:
-        pass
-    lines.append("Local addresses: " + (", ".join(sorted(addresses)) if addresses else "unavailable"))
-    lines.append("Gateway: not detected by portable standard-library method")
-    section("Local network information")
-    for line in lines:
-        print("  " + line)
-    return lines
+    rows.append(("Local addresses", ", ".join(sorted(addrs)) if addrs else "unavailable"))
+    rows.append(("Gateway", "not detected (portable stdlib method not available)"))
+    return emit("Local Network", rows, results)
 
 
-def dns_ttl_cache_inspector(domain, rtype):
-    dns = _require("dns")
-    if not dns:
-        return None
+def tool_20_ttl(domain, rtype, results):
     if not validate_domain(domain):
-        error(f"Invalid domain: {domain}")
-        return None
-    rtype = (rtype or "A").upper().strip()
+        return emit("DNS TTL", [("Error", f"invalid domain: {domain}")], results)
+    rtype = (rtype or "A").upper()
     if rtype not in DNS_RECORD_TYPES:
-        error(f"Unsupported record type: {rtype}")
-        return None
-    import dns.resolver
-    lines = []
-    started = time.monotonic()
+        return emit("DNS TTL", [("Error", f"unsupported type: {rtype}")], results)
     try:
-        answer = dns.resolver.resolve(domain, rtype, lifetime=DNS_TIMEOUT)
-        elapsed = time.monotonic() - started
-        lines.append("Resolver: system-configured resolver")
-        lines.append(f"Query time: {elapsed:.3f}s")
-        lines.append(f"TTL: {answer.rrset.ttl} seconds")
-        lines.extend(f"Answer: {record.to_text()}" for record in answer)
-    except dns.resolver.NXDOMAIN:
-        lines.append("Status: NXDOMAIN")
-    except dns.resolver.NoAnswer:
-        lines.append("Status: NO DATA")
-    except dns.resolver.LifetimeTimeout:
-        lines.append("Status: TIMEOUT")
-    except Exception as exc:
-        lines.append(f"Status: ERROR ({type(exc).__name__})")
-    section(f"DNS TTL & cache - {domain} {rtype}")
-    for line in lines:
-        print("  " + line)
-    print("  Note: TTL is resolver response metadata, not a global-cache inspection.")
-    lines.append("Note: does not inspect every global cache.")
-    return lines
+        resp = dns_resolve(domain, rtype)
+    except DNSError as exc:
+        return emit("DNS TTL", [("Error", str(exc))], results)
+    rows = [("Status", resp["rcode_name"]), ("Query time", f"{resp['elapsed_ms']:.1f} ms")]
+    matches = [rr for rr in resp["answers"] if rr["type"] == DNS_TYPE_CODES[rtype]]
+    for rr in matches:
+        rows.append((f"TTL {rr['ttl']}s", rr["value"]))
+    if not matches:
+        rows.append(("Result", f"no {rtype} records"))
+    return emit(f"DNS TTL - {domain} {rtype}", rows, results)
 
 
-def cdn_waf_detector(target):
-    url = normalize_url(target)
+def tool_21_cdn_waf(url, results):
+    url = normalize_url(url)
     if not url:
-        return ["Error: invalid target URL"]
-    requests = _require("requests")
-    if not requests:
-        return None
-    response = None
+        return emit("CDN / WAF", [("Error", f"invalid URL: {url}")], results)
     try:
-        response = requests.get(url, timeout=API_TIMEOUT, allow_redirects=False, stream=True,
-                                headers={"User-Agent": f"{TOOL_NAME}/{VERSION}"})
-        evidence = []
-        checks = {
-            "Cloudflare": ("cf-ray", "cf-cache-status", "cloudflare"),
-            "Akamai": ("akamai", "akamai-grn", "x-akamai-transformed"),
-            "Fastly": ("fastly", "x-served-by", "x-cache-hits"),
-            "Amazon CloudFront": ("cloudfront", "x-amz-cf-id", "x-amz-cf-pop"),
-            "Imperva / Incapsula": ("incap_ses", "visid_incap", "x-iinfo"),
-            "Sucuri": ("sucuri", "x-sucuri-id", "x-sucuri-cache"),
-        }
-        combined = " ".join(f"{k}: {v}" for k, v in response.headers.items()).lower()
-        for vendor, tokens in checks.items():
-            if any(token in combined for token in tokens):
-                evidence.append(f"Possible {vendor} CDN/WAF indicators")
-        if not evidence:
-            evidence.append("No recognizable CDN/WAF header indicators found")
-        lines = [f"URL: {response.url}", f"HTTP status: {response.status_code}", *evidence,
-                 "Note: header fingerprinting is indicative, not proof."]
+        resp = http_request("GET", url, allow_redirects=False, read_limit=1024)
     except Exception as exc:
-        lines = [f"Request failed: {type(exc).__name__}: {exc}"]
-    finally:
-        if response is not None:
-            try:
-                response.close()
-            except Exception:
-                pass
-    section(f"CDN / WAF detector - {target}")
-    for line in lines:
-        print("  " + line)
-    return lines
-
-
-def redirect_chain_analyzer(target):
-    url = normalize_url(target)
-    if not url:
-        return ["Error: invalid target URL"]
-    requests = _require("requests")
-    if not requests:
-        return None
-    response = None
-    lines = []
-    try:
-        response = requests.get(url, timeout=API_TIMEOUT, allow_redirects=True, stream=True,
-                                headers={"User-Agent": f"{TOOL_NAME}/{VERSION}"})
-        for i, item in enumerate(response.history, 1):
-            lines.append(f"Hop {i}: {item.status_code} {item.url} -> {item.headers.get('Location', '(missing Location)')}")
-        lines.append(f"Final: {response.status_code} {response.url}")
-        lines.append(f"Redirect count: {len(response.history)}")
-    except Exception as exc:
-        lines.append(f"Request failed: {type(exc).__name__}: {exc}")
-    finally:
-        if response is not None:
-            try:
-                response.close()
-            except Exception:
-                pass
-    section(f"Redirect chain - {target}")
-    for line in lines:
-        print("  " + line)
-    return lines
-
-
-def http_performance_breakdown(target):
-    url = normalize_url(target)
-    if not url:
-        return ["Error: invalid target URL"]
-    requests = _require("requests")
-    if not requests:
-        return None
-    response = None
-    lines = []
-    try:
-        started = time.perf_counter()
-        response = requests.get(url, timeout=API_TIMEOUT, allow_redirects=True,
-                                headers={"User-Agent": f"{TOOL_NAME}/{VERSION}"}, stream=True)
-        headers_done = time.perf_counter()
-        size = 0
-        for chunk in response.iter_content(chunk_size=16384):
-            size += len(chunk)
-            if size >= 1024 * 1024:
-                break
-        body_done = time.perf_counter()
-        lines = [
-            f"Final URL: {response.url}",
-            f"Status: {response.status_code}",
-            f"Redirects: {len(response.history)}",
-            f"Request to headers: {(headers_done - started) * 1000:.1f} ms",
-            f"First body-read window: {(body_done - headers_done) * 1000:.1f} ms",
-            f"Bytes sampled: {size}",
-            "Note: timings include network overhead; body sample capped at 1 MiB.",
-        ]
-    except Exception as exc:
-        lines.append(f"Request failed: {type(exc).__name__}: {exc}")
-    finally:
-        if response is not None:
-            try:
-                response.close()
-            except Exception:
-                pass
-    section(f"HTTP performance - {target}")
-    for line in lines:
-        print("  " + line)
-    return lines
-
-
-def certificate_transparency_lookup(domain):
-    domain = (domain or "").strip().lower()
-    domain = domain.removeprefix("https://").removeprefix("http://").split("/")[0]
-    if not validate_domain(domain):
-        return ["Error: invalid domain"]
-    requests = _require("requests")
-    if not requests:
-        return None
-    max_response_bytes = 4 * 1024 * 1024
-    response = None
-    lines = []
-    try:
-        last_timeout = None
-        for attempt in range(2):
-            try:
-                response = requests.get(
-                    "https://crt.sh/",
-                    params={"q": f"%.{domain}", "output": "json"},
-                    timeout=(5, 15 if attempt == 0 else 20),
-                    headers={"User-Agent": f"{TOOL_NAME}/{VERSION}"},
-                    stream=True,
-                )
-                break
-            except requests.exceptions.Timeout as exc:
-                last_timeout = exc
-                if attempt == 1:
-                    raise
-                time.sleep(0.5)
-        if response is None and last_timeout is not None:
-            raise last_timeout
-        response.raise_for_status()
-        payload = bytearray()
-        for chunk in response.iter_content(chunk_size=65536):
-            if not chunk:
-                continue
-            payload.extend(chunk)
-            if len(payload) > max_response_bytes:
-                raise ValueError("response exceeded 4 MiB safety limit")
-        records = json.loads(payload.decode("utf-8"))
-        if not isinstance(records, list):
-            raise ValueError("response was not a JSON list")
-        seen = set()
-        for item in records:
-            if not isinstance(item, dict):
-                continue
-            name = str(item.get("name_value", "")).strip()
-            if name:
-                for value in name.splitlines():
-                    value = value.strip().lower()
-                    if value and value not in seen:
-                        seen.add(value)
-                        if len(seen) >= 100:
-                            break
-            if len(seen) >= 100:
-                break
-        lines = [f"Unique certificate names returned: {len(seen)}", *sorted(seen),
-                 "Note: public CT log results can include historical certificates; capped at 100 names, 4 MiB."]
-    except Exception as exc:
-        if type(exc).__name__ in ("ReadTimeout", "ConnectTimeout", "Timeout"):
-            lines = [
-                "Lookup timed out: crt.sh did not respond in time.",
-                "No results returned; this does not mean the domain has no certificates.",
-                "Try again later when crt.sh is responsive.",
-            ]
-        else:
-            lines = [f"Lookup failed: {type(exc).__name__}: {exc}"]
-    finally:
-        if response is not None:
-            try:
-                response.close()
-            except Exception:
-                pass
-    section(f"Certificate Transparency - {domain}")
-    for line in lines:
-        print("  " + line)
-    return lines
-
-
-def security_headers_analyzer(target):
-    url = normalize_url(target)
-    if not url:
-        return ["Error: invalid target URL"]
-    requests = _require("requests")
-    if not requests:
-        return None
-    expected = {
-        "strict-transport-security": "HSTS",
-        "content-security-policy": "CSP",
-        "x-content-type-options": "X-Content-Type-Options",
-        "x-frame-options": "X-Frame-Options",
-        "referrer-policy": "Referrer-Policy",
-        "permissions-policy": "Permissions-Policy",
+        return emit("CDN / WAF", [("Error", f"{type(exc).__name__}: {exc}")], results)
+    hdrs = " ".join(f"{k}: {v[0]}" for k, v in resp["headers"].items()).lower()
+    vendors = {
+        "Cloudflare": ("cf-ray", "cf-cache-status"),
+        "Akamai": ("akamai", "x-akamai-transformed"),
+        "Fastly": ("fastly", "x-served-by"),
+        "CloudFront": ("cloudfront", "x-amz-cf-id"),
+        "Imperva/Incapsula": ("incap_ses", "x-iinfo"),
+        "Sucuri": ("x-sucuri-id", "x-sucuri-cache"),
     }
-    response = None
-    lines = []
+    rows = [("Status", str(resp["status"]))]
+    hits = 0
+    for vendor, tokens in vendors.items():
+        if any(t in hdrs for t in tokens):
+            rows.append(("Detected", vendor))
+            hits += 1
+    if hits == 0:
+        rows.append(("Detected", "no known CDN/WAF header fingerprint"))
+    return emit(f"CDN / WAF - {url}", rows, results)
+
+
+def tool_22_redirects(url, results):
+    url = normalize_url(url)
+    if not url:
+        return emit("Redirects", [("Error", f"invalid URL: {url}")], results)
     try:
-        response = requests.get(url, timeout=API_TIMEOUT, allow_redirects=True, stream=True,
-                                headers={"User-Agent": f"{TOOL_NAME}/{VERSION}"})
-        headers = {k.lower(): v for k, v in response.headers.items()}
-        lines = [f"Final URL: {response.url}", f"HTTP status: {response.status_code}"]
-        for key, label in expected.items():
-            lines.append(f"{label}: {headers.get(key, 'MISSING')}")
-        lines.append("Note: missing headers are review signals, not automatically vulnerabilities.")
+        resp = http_request("GET", url, read_limit=512)
     except Exception as exc:
-        lines = [f"Request failed: {type(exc).__name__}: {exc}"]
-    finally:
-        if response is not None:
-            try:
-                response.close()
-            except Exception:
-                pass
-    section(f"Security headers - {target}")
-    for line in lines:
-        print("  " + line)
-    return lines
+        return emit("Redirects", [("Error", f"{type(exc).__name__}: {exc}")], results)
+    rows = []
+    for i, hop in enumerate(resp["history"], 1):
+        rows.append((f"Hop {i}", f"{hop['status']} -> {hop['location']}"))
+    rows.append(("Final", f"{resp['status']} {resp['url']}"))
+    rows.append(("Redirect count", str(len(resp["history"]))))
+    return emit(f"Redirects - {url}", rows, results)
 
 
-def latency_route_diagnostics(target):
-    host = (target or "").strip()
-    if host.startswith(("http://", "https://")):
-        try:
-            parsed_url = urlparse(host)
-            _ = parsed_url.port
-            host = parsed_url.hostname or ""
-        except ValueError:
-            return ["Error: invalid target URL"]
-    if not host or any(c.isspace() for c in host):
-        return ["Error: invalid host"]
+def tool_23_http_perf(url, results):
+    url = normalize_url(url)
+    if not url:
+        return emit("HTTP Performance", [("Error", f"invalid URL: {url}")], results)
     try:
-        parsed = ipaddress.ip_address(host)
-        address = str(parsed)
-    except ValueError:
-        if not validate_domain(host):
-            return ["Error: invalid host"]
-        try:
-            address = socket.gethostbyname(host)
-        except OSError as exc:
-            return [f"DNS resolution failed: {exc}"]
-    lines = [f"Host: {host}", f"Resolved address: {address}"]
+        resp = http_request("GET", url, read_limit=1024 * 1024)
+    except Exception as exc:
+        return emit("HTTP Performance", [("Error", f"{type(exc).__name__}: {exc}")], results)
+    rows = [
+        ("Status", str(resp["status"])),
+        ("Elapsed", f"{resp['elapsed_ms']:.1f} ms"),
+        ("Redirects", str(len(resp["history"]))),
+        ("Bytes read", str(len(resp["body"]))),
+        ("Truncated", str(resp["body_truncated"])),
+        ("Note", "body sample capped at 1 MiB"),
+    ]
+    return emit(f"HTTP Performance - {url}", rows, results)
+
+
+def tool_24_ct(domain, results):
+    if not validate_domain(domain):
+        return emit("Certificate Transparency", [("Error", f"invalid domain: {domain}")], results)
+    try:
+        resp = http_request(
+            "GET",
+            f"https://crt.sh/?q=%25.{domain}&output=json",
+            read_limit=4 * 1024 * 1024,
+            timeout=20.0,
+        )
+    except Exception as exc:
+        return emit("Certificate Transparency",
+                    [("Error", f"{type(exc).__name__}: {exc}"),
+                     ("Note", "crt.sh may be slow or unreachable — retry later")], results)
+    try:
+        records = json.loads(resp["body"].decode("utf-8", "replace"))
+    except json.JSONDecodeError:
+        return emit("Certificate Transparency", [("Error", "crt.sh returned non-JSON")], results)
+    names = set()
+    for item in records if isinstance(records, list) else []:
+        name_field = str(item.get("name_value", "")).strip()
+        for value in name_field.splitlines():
+            v = value.strip().lower()
+            if v:
+                names.add(v)
+    rows = [("Unique names", str(len(names)))]
+    rows.extend(("", n) for n in sorted(names)[:80])
+    if len(names) > 80:
+        rows.append(("", f"...{len(names) - 80} more"))
+    return emit(f"Certificate Transparency - {domain}", rows, results)
+
+
+def tool_25_security_headers(url, results):
+    url = normalize_url(url)
+    if not url:
+        return emit("Security Headers", [("Error", f"invalid URL: {url}")], results)
+    try:
+        resp = http_request("GET", url, read_limit=512)
+    except Exception as exc:
+        return emit("Security Headers", [("Error", f"{type(exc).__name__}: {exc}")], results)
+    checks = ["strict-transport-security", "content-security-policy",
+              "x-content-type-options", "x-frame-options",
+              "referrer-policy", "permissions-policy"]
+    rows = [("Status", str(resp["status"]))]
+    for h in checks:
+        vals = resp["headers"].get(h)
+        rows.append((h, vals[0] if vals else "MISSING"))
+    return emit(f"Security Headers - {url}", rows, results)
+
+
+def tool_26_latency(target, results):
+    kind, value = classify_target(target)
+    if kind == "invalid":
+        return emit("Latency", [("Error", f"invalid target: {target}")], results)
+    try:
+        address = socket.gethostbyname(value)
+    except socket.gaierror:
+        return emit("Latency", [("Error", f"could not resolve {value}")], results)
+    rows = [("Host", value), ("Resolved", address)]
     samples = []
-    for index in range(4):
+    for i in range(4):
         started = time.perf_counter()
         try:
             with socket.create_connection((address, 443), timeout=2):
                 samples.append((time.perf_counter() - started) * 1000)
-        except OSError as exc:
-            lines.append(f"TCP/443 sample {index + 1}: failed ({type(exc).__name__})")
+        except OSError:
+            pass
         time.sleep(0.1)
     if samples:
-        lines.extend([
-            f"TCP/443 successful samples: {len(samples)}/4",
-            f"Min: {min(samples):.1f} ms",
-            f"Average: {sum(samples) / len(samples):.1f} ms",
-            f"Max: {max(samples):.1f} ms",
-        ])
-    lines.append("Note: measures TCP connect time to port 443, not ICMP ping or full traceroute.")
-    section(f"Latency diagnostics - {host}")
-    for line in lines:
-        print("  " + line)
-    return lines
+        rows.append(("Successful", f"{len(samples)}/4"))
+        rows.append(("Min", f"{min(samples):.1f} ms"))
+        rows.append(("Avg", f"{sum(samples)/len(samples):.1f} ms"))
+        rows.append(("Max", f"{max(samples):.1f} ms"))
+    else:
+        rows.append(("Result", "no successful TCP/443 connects"))
+    rows.append(("Note", "TCP/443 connect — not ICMP ping"))
+    return emit(f"Latency - {value}", rows, results)
 
 
-def dns_health_checker(domain):
-    dns = _require("dns")
-    if not dns:
-        return None
-    domain = (domain or "").strip().rstrip(".")
+def tool_27_dns_health(domain, results):
     if not validate_domain(domain):
-        return ["Error: invalid domain"]
-    import dns.resolver
-    lines = []
-    resolver = dns.resolver.Resolver()
-    resolver.timeout = DNS_TIMEOUT
-    resolver.lifetime = DNS_TIMEOUT
+        return emit("DNS Health", [("Error", f"invalid domain: {domain}")], results)
+    rows = []
     for rtype in ("A", "AAAA", "MX", "NS", "SOA", "TXT"):
-        started = time.perf_counter()
         try:
-            answer = resolver.resolve(domain, rtype)
-            elapsed = (time.perf_counter() - started) * 1000
-            values = [r.to_text() for r in list(answer)[:5]]
-            lines.append(f"{rtype}: OK ({elapsed:.1f} ms, TTL {answer.rrset.ttl}) - {'; '.join(values)}")
-        except dns.resolver.NXDOMAIN:
-            lines.append(f"{rtype}: NXDOMAIN")
-        except dns.resolver.NoAnswer:
-            lines.append(f"{rtype}: no records")
-        except dns.resolver.LifetimeTimeout:
-            lines.append(f"{rtype}: timeout")
-        except Exception as exc:
-            lines.append(f"{rtype}: error ({type(exc).__name__})")
-    section(f"DNS health check - {domain}")
-    for line in lines:
-        print("  " + line)
-    return lines
+            resp = dns_resolve(domain, rtype)
+            matches = [rr for rr in resp["answers"] if rr["type"] == DNS_TYPE_CODES[rtype]]
+            if matches:
+                ttl = matches[0]["ttl"]
+                values = "; ".join(rr["value"] for rr in matches[:5])
+                rows.append((rtype, f"OK ({resp['elapsed_ms']:.1f}ms TTL {ttl}) {values}"))
+            else:
+                rows.append((rtype, resp["rcode_name"]))
+        except DNSError as exc:
+            rows.append((rtype, f"error: {exc}"))
+    return emit(f"DNS Health - {domain}", rows, results)
 
 
-def smart_diagnostic_report(target):
-    value = (target or "").strip()
-    if not value:
-        return ["Error: target required"]
-    lines = [f"Target: {value}", f"Timestamp: {datetime.datetime.now().isoformat()}"]
-    try:
-        parsed = urlparse(value if "://" in value else "https://" + value)
-        _ = parsed.port
-    except ValueError:
-        return ["Error: invalid target URL"]
-    host = parsed.hostname or value
-    if validate_domain(host):
+def tool_28_smart(target, results):
+    kind, value = classify_target(target)
+    if kind == "invalid":
+        return emit("Smart Diagnostic", [("Error", f"invalid target: {target}")], results)
+    rows = [("Target", value)]
+    if kind == "domain":
         try:
-            addresses = sorted({x[4][0] for x in socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)})
-            lines.append("DNS: resolved - " + ", ".join(addresses[:8]))
-        except OSError as exc:
-            lines.append(f"DNS: resolution failed ({type(exc).__name__})")
-    elif validate_ip(host):
-        lines.append(f"IP syntax: valid ({host})")
-    else:
-        lines.append("Target syntax: could not classify as domain/IP/URL")
-    if parsed.scheme in ("http", "https") and (parsed.netloc or validate_domain(host) or validate_ip(host)):
-        requests = _require("requests")
-        response = None
-        try:
-            url = normalize_url(value)
-            if url and requests:
-                started = time.perf_counter()
-                response = requests.get(url, timeout=API_TIMEOUT, allow_redirects=True, stream=True,
-                                        headers={"User-Agent": f"{TOOL_NAME}/{VERSION}"})
-                lines.extend([
-                    f"HTTP: {response.status_code}",
-                    f"Final URL: {response.url}",
-                    f"Redirects: {len(response.history)}",
-                    f"Time to headers: {(time.perf_counter() - started) * 1000:.1f} ms",
-                ])
-                for key in ("content-type", "server", "strict-transport-security", "content-security-policy"):
-                    lines.append(f"Header {key}: {response.headers.get(key, 'not present')}")
-        except Exception as exc:
-            lines.append(f"HTTP: request failed ({type(exc).__name__})")
-        finally:
-            if response is not None:
-                try:
-                    response.close()
-                except Exception:
-                    pass
-    lines.append("This report is a quick triage summary, not a full security audit.")
-    section(f"Smart diagnostic report - {target}")
-    for line in lines:
-        print("  " + line)
-    return lines
+            resp = dns_resolve(value, "A")
+            addrs = [rr["value"] for rr in resp["answers"] if rr["type"] == 1]
+            rows.append(("DNS A", ", ".join(addrs) if addrs else resp["rcode_name"]))
+        except DNSError as exc:
+            rows.append(("DNS A", f"error: {exc}"))
+    if kind in ("domain", "ip"):
+        for scheme in ("https", "http"):
+            try:
+                resp = http_request("GET", f"{scheme}://{value}", read_limit=512)
+                rows.append((f"{scheme.upper()}", f"{resp['status']} {resp['reason']} in {resp['elapsed_ms']:.0f}ms"))
+                break
+            except Exception as exc:
+                rows.append((f"{scheme.upper()}", f"error: {type(exc).__name__}"))
+    rows.append(("Note", "triage summary only"))
+    return emit(f"Smart Diagnostic - {value}", rows, results)
 
 
-def dns_query_comparison(domain, rtype):
-    dns = _require("dns")
-    if not dns:
-        return None
-    domain = (domain or "").strip().rstrip(".")
-    rtype = (rtype or "A").upper().strip()
+def tool_29_dns_compare(domain, rtype, results):
     if not validate_domain(domain):
-        return ["Error: invalid domain"]
+        return emit("DNS Compare", [("Error", f"invalid domain: {domain}")], results)
+    rtype = (rtype or "A").upper()
     if rtype not in DNS_RECORD_TYPES:
-        return [f"Error: unsupported record type ({', '.join(DNS_RECORD_TYPES)})"]
-    results = {}
-    threads = []
-    for _name, resolver_ip in PUBLIC_RESOLVERS:
-        thread = threading.Thread(target=_query_resolver, args=(resolver_ip, domain, rtype, results), daemon=True)
-        thread.start()
-        threads.append(thread)
-    for thread in threads:
-        thread.join(timeout=DNS_TIMEOUT + 1)
-    lines = [f"Domain: {domain}", f"Record type: {rtype}"]
-    usable = []
-    for name, resolver_ip in PUBLIC_RESOLVERS:
-        value = results.get(resolver_ip, "NO RESPONSE")
-        if isinstance(value, list):
-            rendered = ", ".join(value) if value else "(no records)"
-            usable.append(tuple(value))
-        else:
-            rendered = value
-        lines.append(f"{name} ({resolver_ip}): {rendered}")
+        return emit("DNS Compare", [("Error", f"unsupported type: {rtype}")], results)
+    rows = []
+    sets = {}
+    for label, server in PUBLIC_RESOLVERS:
+        try:
+            resp = dns_resolve(domain, rtype, server=server)
+            vals = sorted(rr["value"] for rr in resp["answers"]
+                          if rr["type"] == DNS_TYPE_CODES[rtype])
+            sets[label] = tuple(vals)
+            rows.append((label, ", ".join(vals) if vals else "(none)"))
+        except DNSError as exc:
+            sets[label] = None
+            rows.append((label, f"error: {exc}"))
+    usable = [v for v in sets.values() if v is not None]
     if len(usable) >= 2:
-        lines.append("Comparison: " + ("answers agree" if len(set(usable)) == 1 else "answers differ"))
+        rows.append(("Verdict", "agree" if len(set(usable)) == 1 else "differ"))
     else:
-        lines.append("Comparison: insufficient successful answers")
-    section(f"DNS query comparison - {domain} {rtype}")
-    for line in lines:
-        print("  " + line)
-    return lines
+        rows.append(("Verdict", "insufficient responses"))
+    return emit(f"DNS Compare - {domain} {rtype}", rows, results)
 
 
-def route_diagnostics(target):
-    host = (target or "").strip()
-    if not host or any(ch.isspace() for ch in host) or not (validate_domain(host) or validate_ip(host)):
-        return ["Error: enter a valid domain or IP address"]
-    lines = [f"Target: {host}", "Hop limit: 12", "Probe count: 1 per hop"]
-    try:
-        if os.name == "nt":
-            executable = shutil.which("tracert")
-            command = [executable, "-d", "-h", "12", "-w", "1000", host] if executable else None
-        else:
-            executable = shutil.which("traceroute")
-            tracepath = shutil.which("tracepath")
-            if executable:
-                command = [executable, "-n", "-m", "12", "-w", "1", "-q", "1", host]
-            elif tracepath:
-                command = [tracepath, "-m", "12", host]
-            else:
-                command = None
-        if not command:
-            lines.append("Unavailable: traceroute/tracepath utility is not installed.")
-            if "com.termux" in os.environ.get("PREFIX", ""):
-                lines.append("Termux: install with `pkg install traceroute`.")
-            else:
-                lines.append("Install a traceroute utility using your OS package manager.")
-        else:
-            completed = subprocess.run(command, capture_output=True, text=True, timeout=18, check=False)
-            output = (completed.stdout or completed.stderr or "(no output)").strip().splitlines()
-            lines.extend(output[:18])
-            lines.append(f"Exit code: {completed.returncode}")
-    except subprocess.TimeoutExpired:
-        lines.append("Stopped: traceroute exceeded the 18-second time limit.")
-    except OSError as exc:
-        lines.append(f"Traceroute failed: {type(exc).__name__}")
-    lines.append("Note: routes can hide hops or show timeouts; this is not a port scan.")
-    section(f"Route diagnostics - {host}")
-    for line in lines:
-        print("  " + line)
-    return lines
-
-
-def connection_stability_monitor(target, port=443, samples=5, interval=2):
+def tool_30_traceroute(target, results):
     host = (target or "").strip()
     if host.startswith(("http://", "https://")):
         try:
-            parsed_url = urlparse(host)
-            _ = parsed_url.port
-            host = parsed_url.hostname or ""
+            host = urlparse(host).hostname or ""
         except ValueError:
-            return ["Error: invalid target URL"]
-    if not (validate_domain(host) or validate_ip(host)):
-        return ["Error: enter a valid domain or IP address"]
+            return emit("Traceroute", [("Error", "invalid target URL")], results)
     try:
-        port = int(port)
-        samples = int(samples)
-        interval = float(interval)
+        target_ip = socket.gethostbyname(host)
+    except socket.gaierror:
+        return emit("Traceroute", [("Error", f"could not resolve {host}")], results)
+    info(f"tracing {host} ({target_ip})")
+    hops = _traceroute_icmp(target_ip, 15, 3, 1.5)
+    method = "ICMP Echo (raw)"
+    if hops is None:
+        hops = _traceroute_tcp(target_ip, 443, 15, 3, 1.5)
+        method = "TCP SYN/443 (IP_RECVERR)"
+    if hops is None:
+        return emit("Traceroute", [("Error", "no raw-ICMP or IP_RECVERR path available"),
+                                   ("Platform", sys.platform)], results)
+    rows = [("Target", f"{host} ({target_ip})"), ("Method", method)]
+    reached = False
+    for hop in hops:
+        times = [s[1] for s in hop["samples"] if s and s[0] and s[1] is not None]
+        loss = sum(1 for s in hop["samples"] if not s or not s[0]) / len(hop["samples"]) * 100
+        primary = sorted(hop["responders"])[0] if hop["responders"] else "*"
+        rtt = f"{min(times):.1f}/{sum(times)/len(times):.1f}/{max(times):.1f} ms" if times else "*"
+        ecmp = f" (+{len(hop['responders']) - 1} more)" if len(hop["responders"]) > 1 else ""
+        rows.append((f"Hop {hop['ttl']}", f"{rtt}  loss={loss:.0f}%  {primary}{ecmp}"))
+        if primary != "*":
+            ptr, asn = _hop_enrichment(primary)
+            if ptr:
+                rows.append(("", f"    PTR: {ptr}"))
+            if asn:
+                rows.append(("", f"    ASN: {asn}"))
+        if primary == target_ip:
+            rows.append(("Result", f"target reached at hop {hop['ttl']}"))
+            reached = True
+            break
+    if not reached:
+        rows.append(("Result", "max hops reached"))
+    return emit(f"Traceroute - {host}", rows, results)
+
+
+def tool_31_connection_stability(target, port, samples, interval, results):
+    kind, value = classify_target(target)
+    if kind == "invalid":
+        return emit("Connection Stability", [("Error", f"invalid target: {target}")], results)
+    try:
+        port = int(port or 443)
+        samples = int(samples or 5)
+        interval = float(interval or 2)
     except (TypeError, ValueError):
-        return ["Error: port, samples, or interval is invalid"]
-    if not 1 <= port <= 65535 or not 1 <= samples <= 30 or not 1 <= interval <= 10:
-        return ["Error: port 1-65535, samples 1-30, interval 1-10 seconds"]
+        return emit("Connection Stability", [("Error", "invalid port/samples/interval")], results)
+    if not (1 <= port <= 65535 and 1 <= samples <= 30 and 1 <= interval <= 10):
+        return emit("Connection Stability",
+                    [("Error", "port 1-65535, samples 1-30, interval 1-10s")], results)
+    try:
+        address = socket.gethostbyname(value)
+    except socket.gaierror:
+        return emit("Connection Stability", [("Error", f"could not resolve {value}")], results)
     checks = []
-    for index in range(samples):
+    for i in range(samples):
         started = time.perf_counter()
         try:
-            with socket.create_connection((host, port), timeout=3):
-                checks.append((True, (time.perf_counter() - started) * 1000, "connected"))
-        except OSError as exc:
-            checks.append((False, (time.perf_counter() - started) * 1000, type(exc).__name__))
-        if index + 1 < samples:
+            with socket.create_connection((address, port), timeout=3):
+                checks.append((True, (time.perf_counter() - started) * 1000))
+        except OSError:
+            checks.append((False, (time.perf_counter() - started) * 1000))
+        if i + 1 < samples:
             time.sleep(interval)
-    successful = [elapsed for ok, elapsed, _detail in checks if ok]
-    lines = [
-        f"Target: {host}:{port}",
-        f"Samples: {samples}",
-        f"Successful: {len(successful)}/{samples}",
-        f"Success rate: {len(successful) / samples * 100:.1f}%",
+    ok_count = sum(1 for c in checks if c[0])
+    rows = [
+        ("Target", f"{address}:{port}"),
+        ("Samples", str(samples)),
+        ("Successful", f"{ok_count}/{samples}"),
+        ("Rate", f"{ok_count / samples * 100:.1f}%"),
     ]
-    if successful:
-        lines.extend([
-            f"Min TCP connect: {min(successful):.1f} ms",
-            f"Average TCP connect: {sum(successful) / len(successful):.1f} ms",
-            f"Max TCP connect: {max(successful):.1f} ms",
-        ])
-    lines.extend(f"Sample {i}: {'OK' if ok else 'FAIL'} ({elapsed:.1f} ms; {detail})"
-                 for i, (ok, elapsed, detail) in enumerate(checks, 1))
-    lines.append("Note: measures TCP connection stability, not ICMP latency or app health.")
-    section(f"Connection stability - {host}:{port}")
-    for line in lines:
-        print("  " + line)
-    return lines
+    good = [c[1] for c in checks if c[0]]
+    if good:
+        rows.append(("Min/Avg/Max", f"{min(good):.1f} / {sum(good)/len(good):.1f} / {max(good):.1f} ms"))
+    return emit(f"Connection Stability - {value}:{port}", rows, results)
 
 
-def tls_compatibility_check(target, port=443):
-    host = (target or "").strip()
-    if host.startswith(("http://", "https://")):
-        try:
-            parsed_url = urlparse(host)
-            _ = parsed_url.port
-            host = parsed_url.hostname or ""
-        except ValueError:
-            return ["Error: invalid target URL"]
-    if not (validate_domain(host) or validate_ip(host)):
-        return ["Error: enter a valid domain or IP address"]
+def tool_32_tls_compat(target, port, results):
+    kind, value = classify_target(target)
+    if kind == "invalid":
+        return emit("TLS Compatibility", [("Error", f"invalid target: {target}")], results)
+    host = value
     try:
-        port = int(port)
+        port = int(port or 443)
     except (TypeError, ValueError):
-        return ["Error: invalid port"]
+        return emit("TLS Compatibility", [("Error", "invalid port")], results)
     if not 1 <= port <= 65535:
-        return ["Error: port must be between 1 and 65535"]
-    tls_versions = [
-        ("TLSv1", getattr(ssl.TLSVersion, "TLSv1", None)),
-        ("TLSv1.1", getattr(ssl.TLSVersion, "TLSv1_1", None)),
-        ("TLSv1.2", getattr(ssl.TLSVersion, "TLSv1_2", None)),
-        ("TLSv1.3", getattr(ssl.TLSVersion, "TLSv1_3", None)),
+        return emit("TLS Compatibility", [("Error", "port out of range")], results)
+    versions = [
+        ("TLS 1.0", getattr(ssl.TLSVersion, "TLSv1", None)),
+        ("TLS 1.1", getattr(ssl.TLSVersion, "TLSv1_1", None)),
+        ("TLS 1.2", getattr(ssl.TLSVersion, "TLSv1_2", None)),
+        ("TLS 1.3", getattr(ssl.TLSVersion, "TLSv1_3", None)),
     ]
-    lines = [f"Target: {host}:{port}", f"OpenSSL: {ssl.OPENSSL_VERSION}"]
-    for label, version in tls_versions:
-        if version is None:
-            lines.append(f"{label}: unavailable in this Python/OpenSSL build")
+    rows = [("Target", f"{host}:{port}"), ("OpenSSL", ssl.OPENSSL_VERSION)]
+    for label, ver in versions:
+        if ver is None:
+            rows.append((label, "unavailable in this build"))
             continue
         try:
             context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
             context.check_hostname = False
             context.verify_mode = ssl.CERT_NONE
-            context.minimum_version = version
-            context.maximum_version = version
+            context.minimum_version = ver
+            context.maximum_version = ver
             with socket.create_connection((host, port), timeout=3) as raw_sock:
-                server_name = host if not validate_ip(host) else None
-                with context.wrap_socket(raw_sock, server_hostname=server_name) as tls_sock:
-                    negotiated = tls_sock.version() or label
-            lines.append(f"{label}: negotiated ({negotiated})")
+                sname = host if not validate_ip(host) else None
+                with context.wrap_socket(raw_sock, server_hostname=sname) as tls:
+                    rows.append((label, f"negotiated ({tls.version()})"))
         except (OSError, ssl.SSLError, ValueError) as exc:
-            lines.append(f"{label}: not negotiated ({type(exc).__name__})")
-    lines.append("Warning: certificate verification is disabled for this compatibility probe; not a cert-validity check.")
-    lines.append("Note: failure can mean server policy, network filtering, or local OpenSSL restrictions.")
-    section(f"TLS compatibility - {host}:{port}")
-    for line in lines:
-        print("  " + line)
-    return lines
+            rows.append((label, f"failed ({type(exc).__name__})"))
+    rows.append(("Note", "certificate verification disabled for this probe only"))
+    return emit(f"TLS Compatibility - {host}:{port}", rows, results)
 
 
-def http_method_checker(target):
-    url = normalize_url(target)
+def tool_33_http_method(url, results):
+    url = normalize_url(url)
     if not url:
-        return ["Error: invalid target URL"]
-    requests = _require("requests")
-    if not requests:
-        return None
+        return emit("HTTP Method", [("Error", f"invalid URL: {url}")], results)
     try:
-        response = requests.options(url, timeout=API_TIMEOUT, allow_redirects=False,
-                                    headers={"User-Agent": f"{TOOL_NAME}/{VERSION}"})
-        status = response.status_code
-        lines = [
-            f"URL: {url}",
-            f"HTTP status: {status}",
-            f"Allow header: {response.headers.get('Allow', '(not supplied)')}",
-            f"Access-Control-Allow-Methods: {response.headers.get('Access-Control-Allow-Methods', '(not supplied)')}",
-        ]
-        if status == 405:
-            lines.append("Interpretation: this endpoint does not allow OPTIONS (or a proxy/WAF blocks it).")
-        elif status == 501:
-            lines.append("Interpretation: OPTIONS is not implemented by this server or intermediary.")
-        elif 200 <= status < 300:
-            lines.append("Interpretation: OPTIONS request succeeded; inspect headers for advertised methods.")
-        else:
-            lines.append("Interpretation: response to OPTIONS only; does not establish whether GET works.")
-        lines.append("Only OPTIONS was sent; no state-changing methods attempted.")
-        response.close()
+        resp = http_request("OPTIONS", url, allow_redirects=False, read_limit=512)
     except Exception as exc:
-        lines = [f"Request failed: {type(exc).__name__}: {exc}"]
-    section(f"HTTP method checker - {target}")
-    for line in lines:
-        print("  " + line)
-    return lines
+        return emit("HTTP Method", [("Error", f"{type(exc).__name__}: {exc}")], results)
+    rows = [
+        ("Status", str(resp["status"])),
+        ("Allow", resp["headers"].get("allow", ["(not supplied)"])[0]),
+        ("CORS Methods", resp["headers"].get("access-control-allow-methods", ["(not supplied)"])[0]),
+    ]
+    return emit(f"HTTP Method - {url}", rows, results)
 
 
-def ipv6_readiness_check(domain):
-    domain = (domain or "").strip().rstrip(".")
+def tool_34_ipv6_readiness(domain, results):
     if not validate_domain(domain):
-        return ["Error: enter a valid domain (not an IP address)"]
-    lines = [f"Domain: {domain}"]
+        return emit("IPv6 Readiness", [("Error", f"invalid domain: {domain}")], results)
     try:
         infos = socket.getaddrinfo(domain, 443, socket.AF_INET6, socket.SOCK_STREAM)
-        addresses = list(dict.fromkeys(info[4][0] for info in infos))
-    except socket.gaierror as exc:
-        lines.extend(["AAAA / IPv6 resolution: unavailable", f"Reason: {type(exc).__name__}"])
-        lines.append("Status: IPv6 readiness could not be confirmed.")
-        section(f"IPv6 readiness - {domain}")
-        for line in lines:
-            print("  " + line)
-        return lines
-    lines.append("IPv6 addresses: " + ", ".join(addresses[:8]))
+        addrs = list(dict.fromkeys(i[4][0] for i in infos))
+    except socket.gaierror:
+        return emit("IPv6 Readiness",
+                    [("AAAA", "no AAAA record"), ("Status", "IPv6 not resolvable")], results)
+    rows = [("AAAA", ", ".join(addrs[:8]))]
     connected = False
-    for address in addresses[:2]:
+    for addr in addrs[:2]:
         try:
-            with socket.create_connection((address, 443, 0, 0), timeout=3):
+            with socket.create_connection((addr, 443, 0, 0), timeout=3):
+                rows.append(("TCP/443", f"connected to {addr}"))
                 connected = True
-                lines.append(f"TCP/443 over IPv6: connected to {address}")
                 break
         except OSError as exc:
-            lines.append(f"TCP/443 to {address}: failed ({type(exc).__name__})")
-    lines.append("Status: IPv6 path reachable" if connected else "Status: AAAA exists, but IPv6 connection not confirmed")
-    section(f"IPv6 readiness - {domain}")
-    for line in lines:
-        print("  " + line)
-    return lines
+            rows.append(("TCP/443", f"{addr}: {type(exc).__name__}"))
+    rows.append(("Status", "reachable" if connected else "AAAA present, connect failed"))
+    return emit(f"IPv6 Readiness - {domain}", rows, results)
 
 
 def _local_data_dir():
     return os.path.join(os.path.expanduser("~"), ".ip-finder")
 
 
-def _load_local_json(filename, default):
-    path = os.path.join(_local_data_dir(), filename)
+def _load_json(filename, default):
     try:
-        with open(path, "r", encoding="utf-8") as handle:
-            value = json.load(handle)
-        return value if isinstance(value, type(default)) else default
+        with open(os.path.join(_local_data_dir(), filename), "r", encoding="utf-8") as fh:
+            v = json.load(fh)
+        return v if isinstance(v, type(default)) else default
     except (OSError, ValueError, TypeError):
         return default
 
 
-def _save_local_json(filename, value):
+def _save_json(filename, value):
     directory = _local_data_dir()
     os.makedirs(directory, mode=0o700, exist_ok=True)
-    try:
-        os.chmod(directory, 0o700)
-    except OSError:
-        pass
     path = os.path.join(directory, filename)
-    temp_path = path + ".tmp"
-    with open(temp_path, "w", encoding="utf-8") as handle:
-        json.dump(value, handle, ensure_ascii=False, indent=2)
-        handle.write("\n")
-    try:
-        os.chmod(temp_path, 0o600)
-    except OSError:
-        pass
-    os.replace(temp_path, path)
-    return path
+    temp = path + ".tmp"
+    with open(temp, "w", encoding="utf-8") as fh:
+        json.dump(value, fh, ensure_ascii=False, indent=2)
+    os.replace(temp, path)
 
 
-def historical_results():
-    history = _load_local_json("session_history.json", [])
-    history = [item for item in history if isinstance(item, dict)]
-    section("Historical results")
-    print("  1. Save current session snapshot")
+def tool_35_historical(results):
+    history = _load_json("session_history.json", [])
+    history = [h for h in history if isinstance(h, dict)]
+    section("Historical Results")
+    print("  1. Save current session as a snapshot")
     print("  2. View saved snapshots")
     print("  3. Compare two snapshots")
     choice = ask("Select [1-3]")
+    rows = []
     if choice == "1":
         if RESULTS.empty():
-            return ["No current session results to save"]
-        snapshot = {
-            "timestamp": datetime.datetime.now().isoformat(),
-            "sections": [{"title": title, "lines": lines} for title, lines in RESULTS.sections],
-        }
-        history.append(snapshot)
-        history = history[-50:]
-        try:
-            path = _save_local_json("session_history.json", history)
-            lines = [f"Saved snapshot #{len(history)}", f"Storage: {path}", "Max retained snapshots: 50"]
-        except OSError as exc:
-            lines = [f"Save failed: {type(exc).__name__}: {exc}"]
+            rows.append(("Result", "no results to save — run a tool first"))
+        else:
+            snapshot = {
+                "timestamp": datetime.datetime.now().isoformat(),
+                "sections": [{"title": t, "lines": lines}
+                             for t, lines in RESULTS.sections],
+            }
+            history.append(snapshot)
+            history = history[-50:]
+            try:
+                _save_json("session_history.json", history)
+                rows.append(("Saved", f"snapshot #{len(history)}"))
+                rows.append(("Retention", "50 latest snapshots"))
+            except OSError as exc:
+                rows.append(("Error", f"save failed: {exc}"))
     elif choice == "2":
-        lines = [f"Saved snapshots: {len(history)}"]
-        lines.extend(
-            f"#{index} {item.get('timestamp', 'unknown')} - "
-            f"{len(item.get('sections', [])) if isinstance(item.get('sections', []), list) else 0} section(s)"
-            for index, item in enumerate(history, 1)
-        )
+        rows.append(("Saved snapshots", str(len(history))))
+        for i, snap in enumerate(history, 1):
+            n = len(snap.get("sections", []))
+            rows.append((f"#{i}", f"{snap.get('timestamp', '?')}  {n} sections"))
         if not history:
-            lines.append("No snapshots yet; save a session after running one or more tools.")
+            rows.append(("Note", "no snapshots yet — use option 1 after running tools"))
     elif choice == "3":
         if len(history) < 2:
-            lines = ["At least two saved snapshots are needed for comparison."]
+            rows.append(("Note", "need at least 2 saved snapshots to compare"))
         else:
-            print("  Available snapshots:")
-            for index, item in enumerate(history, 1):
-                print(f"  #{index} {item.get('timestamp', 'unknown')}")
+            for i, snap in enumerate(history, 1):
+                print(f"  #{i} {snap.get('timestamp', '?')}")
             try:
-                first = int(ask("Older snapshot number"))
-                second = int(ask("Newer snapshot number"))
-                if (first < 1 or second < 1 or first > len(history)
-                        or second > len(history) or first == second):
+                first = int(ask("Older snapshot #"))
+                second = int(ask("Newer snapshot #"))
+                if not (1 <= first <= len(history) and 1 <= second <= len(history)
+                        and first != second):
                     raise ValueError
                 a, b = history[first - 1], history[second - 1]
 
-                def normalize(item):
-                    entries = item.get("sections", [])
-                    if not isinstance(entries, list):
-                        return {}
-                    return {entry.get("title", ""): entry.get("lines", [])
-                            for entry in entries if isinstance(entry, dict)}
+                def norm(s):
+                    return {sec.get("title", ""): tuple(sec.get("lines", []))
+                            for sec in s.get("sections", []) if isinstance(sec, dict)}
 
-                old, new = normalize(a), normalize(b)
-                titles = sorted(set(old) | set(new))
-                lines = [f"Comparing #{first} ({a.get('timestamp')}) to #{second} ({b.get('timestamp')})"]
-                for title in titles:
-                    if old.get(title) == new.get(title):
-                        lines.append(f"UNCHANGED: {title}")
-                    elif title not in old:
-                        lines.append(f"ADDED: {title}")
+                old, new = norm(a), norm(b)
+                for title in sorted(set(old) | set(new)):
+                    if title not in old:
+                        rows.append((title, "ADDED"))
                     elif title not in new:
-                        lines.append(f"REMOVED: {title}")
+                        rows.append((title, "REMOVED"))
+                    elif old[title] == new[title]:
+                        rows.append((title, "unchanged"))
                     else:
-                        lines.append(f"CHANGED: {title}")
+                        rows.append((title, "CHANGED"))
             except (ValueError, TypeError):
-                lines = ["Invalid snapshot number selection."]
+                rows.append(("Error", "invalid snapshot numbers"))
     else:
-        lines = ["Cancelled: choose 1, 2, or 3."]
-    for line in lines:
-        print("  " + line)
-    return lines
+        rows.append(("Result", "cancelled"))
+    section("Result")
+    for label, value in rows:
+        print(f"  {str(label):<20}{value}")
+    results.add("Historical Results", [f"{l}: {v}" for l, v in rows])
+    return rows
 
 
-def batch_domain_checker(filepath):
-    dns = _require("dns")
-    if not dns:
-        return None
+def tool_36_batch_domains(filepath, results):
     filepath = (filepath or "").strip()
     if not filepath:
-        return ["Error: file path is required"]
+        return emit("Batch Domains", [("Error", "file path is required")], results)
     try:
         if os.path.getsize(filepath) > 1024 * 1024:
-            return ["Error: input file exceeds 1 MiB"]
-        with open(filepath, "r", encoding="utf-8-sig") as handle:
-            raw_domains = [line.strip() for line in handle
-                           if line.strip() and not line.strip().startswith("#")]
+            return emit("Batch Domains", [("Error", "file >1 MiB")], results)
+        with open(filepath, "r", encoding="utf-8-sig") as fh:
+            raw = [ln.strip() for ln in fh if ln.strip() and not ln.strip().startswith("#")]
     except OSError as exc:
-        return [f"Could not read file: {type(exc).__name__}: {exc}"]
-    unique = list(dict.fromkeys(raw_domains))
+        return emit("Batch Domains", [("Error", f"{type(exc).__name__}: {exc}")], results)
+    unique = list(dict.fromkeys(raw))
     if len(unique) > 50:
-        return [f"Error: file has {len(unique)} domains; maximum is 50 per run"]
-    invalid = [d for d in unique if not validate_domain(d.rstrip("."))]
-    domains = [d.rstrip(".") for d in unique if validate_domain(d.rstrip("."))]
-    if not domains:
-        return ["No valid domains found in the file"]
-    from concurrent.futures import ThreadPoolExecutor
-    import dns.resolver
-
-    def inspect_domain(domain):
-        resolver = dns.resolver.Resolver()
-        resolver.timeout = 1.5
-        resolver.lifetime = 1.5
-        found = []
-        for rtype in ("A", "AAAA"):
-            try:
-                answer = resolver.resolve(domain, rtype, lifetime=1.5)
-                found.extend(f"{rtype}={record.to_text()}" for record in list(answer)[:4])
-            except dns.resolver.NXDOMAIN:
-                return f"{domain}: NXDOMAIN"
-            except dns.resolver.NoAnswer:
-                continue
-            except dns.resolver.LifetimeTimeout:
-                found.append(f"{rtype}=TIMEOUT")
-            except Exception as exc:
-                found.append(f"{rtype}=ERROR({type(exc).__name__})")
-        return f"{domain}: " + (", ".join(found) if found else "no A/AAAA answers")
-
-    with ThreadPoolExecutor(max_workers=4) as pool:
-        futures = {domain: pool.submit(inspect_domain, domain) for domain in domains}
-        results = [futures[domain].result() for domain in domains]
-    lines = [
-        f"Input domains: {len(unique)}",
-        f"Valid domains: {len(domains)}",
-        f"Invalid entries skipped: {len(invalid)}",
-    ]
-    lines.extend(f"INVALID: {entry}" for entry in invalid[:10])
-    lines.extend(results)
-    lines.append("Safety limit: DNS lookups only, max 50 domains, four workers, no port scans or HTTP.")
-    section("Batch domain checker")
-    for line in lines:
-        print("  " + line)
-    return lines
-
-
-def email_dns_deep_check(domain):
-    dns = _require("dns")
-    if not dns:
-        return None
-    domain = (domain or "").strip().rstrip(".")
-    if not validate_domain(domain):
-        return ["Error: invalid domain"]
-    import dns.resolver
-    from concurrent.futures import ThreadPoolExecutor
-
-    selectors = ("default", "selector1", "selector2", "google", "k1", "mail")
-
-    def query(name, rtype):
-        resolver = dns.resolver.Resolver()
-        resolver.timeout = 2
-        resolver.lifetime = 2
-        try:
-            answer = resolver.resolve(name, rtype, lifetime=2)
-            return [record.to_text() for record in list(answer)[:8]]
-        except dns.resolver.NXDOMAIN:
-            return []
-        except dns.resolver.NoAnswer:
-            return []
-        except dns.resolver.LifetimeTimeout:
-            return ["TIMEOUT"]
-        except Exception as exc:
-            return [f"ERROR({type(exc).__name__})"]
-
-    queries = [("MX", domain, "MX"), ("TXT", domain, "TXT"), ("DMARC", f"_dmarc.{domain}", "TXT")]
-    queries.extend((f"DKIM {sel}", f"{sel}._domainkey.{domain}", "TXT") for sel in selectors)
-    results = {}
-    with ThreadPoolExecutor(max_workers=4) as pool:
-        futures = {label: pool.submit(query, name, rtype) for label, name, rtype in queries}
-        for label, future in futures.items():
-            results[label] = future.result()
-
-    def is_query_result(value):
-        return value != "TIMEOUT" and not str(value).startswith("ERROR(")
-
-    mx = [r for r in results.get("MX", []) if is_query_result(r)]
-    txt = [r for r in results.get("TXT", []) if is_query_result(r)]
-    dmarc = [r for r in results.get("DMARC", []) if is_query_result(r)]
-    spf = [r for r in txt if "v=spf1" in r.lower()]
-    dmarc_records = [r for r in dmarc if "v=dmarc1" in r.lower()]
-    lines = [
-        f"Domain: {domain}",
-        f"MX records: {len(mx)}",
-        *[f"  {record}" for record in mx[:5]],
-        f"SPF records found: {len(spf)}",
-    ]
-    for label, values in (("MX", results.get("MX", [])),
-                          ("TXT", results.get("TXT", [])),
-                          ("DMARC", results.get("DMARC", []))):
-        status_values = [v for v in values if not is_query_result(v)]
-        lines.extend(f"{label} lookup status: {v}" for v in status_values)
-    lines.extend(f"  SPF: {record}" for record in spf)
-    if len(spf) > 1:
-        lines.append("WARNING: multiple SPF records can cause SPF permerror.")
-    if not spf:
-        lines.append("SPF: not found (or DNS lookup inconclusive)")
-    lines.append(f"DMARC records found: {len(dmarc_records)}")
-    for record in dmarc_records:
-        policy = re.search(r"(?:^|;)\s*p\s*=\s*([^;\s]+)", record.strip().strip('"'), re.I)
-        lines.append(f"  DMARC: {record}")
-        lines.append(f"  DMARC policy: {policy.group(1) if policy else 'unspecified'}")
-    if not dmarc_records:
-        lines.append("DMARC: not found (or DNS lookup inconclusive)")
-    for sel in selectors:
-        answers = results.get(f"DKIM {sel}", [])
-        dkim_records = [a for a in answers if is_query_result(a)]
-        dkim_statuses = [a for a in answers if not is_query_result(a)]
-        if dkim_records:
-            state = "record found"
-        elif dkim_statuses:
-            state = "lookup inconclusive"
-        else:
-            state = "no TXT record returned"
-        lines.append(f"DKIM selector {sel}: {state}")
-        lines.extend(f"  {item[:180]}" for item in dkim_records[:1])
-        lines.extend(f"  Lookup status: {item}" for item in dkim_statuses[:1])
-    lines.append("Note: DKIM selectors vary by provider; common-selector checks don't prove DKIM is absent.")
-    section(f"Email DNS deep check - {domain}")
-    for line in lines:
-        print("  " + line)
-    return lines
-
-
-def configuration_validator():
-    ok, missing_required, missing_optional = check_dependencies()
-    lines = [
-        f"Tool: {TOOL_NAME} v{VERSION}",
-        f"Author: {AUTHOR}",
-        f"Python: {sys.version.split()[0]}",
-        f"Platform: {sys.platform}",
-        f"OpenSSL: {ssl.OPENSSL_VERSION}",
-        "Required dependencies: " + ("OK" if ok else ", ".join(missing_required)),
-        "Optional dependencies: " + (", ".join(missing_optional) if missing_optional else "all available"),
-        f"DNS timeout: {DNS_TIMEOUT}s",
-        f"HTTP/API timeout: {API_TIMEOUT}s",
-        f"Port timeout: {PORT_TIMEOUT}s",
-    ]
-    for name, value in (("requests", _requests), ("dnspython", _dns), ("python-whois", _whois)):
-        lines.append(f"Loaded module {name}: {'yes' if value is not None else 'no'}")
-    lines.append(f"Traceroute utility: {shutil.which('traceroute') or shutil.which('tracert') or 'not installed'}")
-    try:
-        directory = _local_data_dir()
-        os.makedirs(directory, mode=0o700, exist_ok=True)
-        probe = os.path.join(directory, ".write-test")
-        with open(probe, "w", encoding="utf-8") as handle:
-            handle.write("ok")
-        os.remove(probe)
-        lines.append("Private data directory write: OK")
-    except OSError as exc:
-        lines.append(f"Private data directory write: FAILED ({type(exc).__name__})")
-    lines.append("Note: checks local configuration only; does not contact external targets.")
-    section("Configuration validator")
-    for line in lines:
-        print("  " + line)
-    return lines
-
-
-def uptime_history_monitor(target, checks=3, interval=5):
-    url = normalize_url(target)
-    if not url:
-        return ["Error: enter a valid target URL or domain"]
-    try:
-        checks = int(checks)
-        interval = float(interval)
-    except (TypeError, ValueError):
-        return ["Error: invalid check count or interval"]
-    if not 1 <= checks <= 30 or not 5 <= interval <= 60:
-        return ["Error: checks must be 1-30 and interval must be 5-60 seconds"]
-    requests = _require("requests")
-    if not requests:
-        return None
-    observations = []
-    for index in range(checks):
-        started = time.perf_counter()
-        record = {"timestamp": datetime.datetime.now().isoformat(), "target": url, "ok": False,
-                  "status": None, "latency_ms": None, "error": None}
-        try:
-            response = requests.get(url, timeout=5, allow_redirects=False, stream=True,
-                                    headers={"User-Agent": f"{TOOL_NAME}/{VERSION}"})
-            record["status"] = response.status_code
-            record["ok"] = response.status_code < 500
-            response.close()
-        except Exception as exc:
-            record["error"] = type(exc).__name__
-        record["latency_ms"] = round((time.perf_counter() - started) * 1000, 2)
-        observations.append(record)
-        print(f"  [{index + 1}/{checks}] {record['timestamp']} "
-              f"{'UP' if record['ok'] else 'DOWN'} status={record['status']} latency={record['latency_ms']}ms")
-        if index + 1 < checks:
-            time.sleep(interval)
-    success_count = sum(1 for item in observations if item["ok"])
-    lines = [
-        f"Target: {url}",
-        f"Checks: {checks}",
-        f"Reachable HTTP responses: {success_count}/{checks}",
-        f"Observed availability: {success_count / checks * 100:.1f}%",
-        f"Mean request-to-headers: {sum(item['latency_ms'] for item in observations) / len(observations):.1f} ms",
-        "Note: HTTP 5xx count as unavailable; 2xx-4xx count as an HTTP response. Short observation, not full SLA.",
-    ]
-    history = _load_local_json("uptime_history.json", [])
-    history.append({"created_at": datetime.datetime.now().isoformat(), "target": url,
-                    "checks": observations,
-                    "availability_percent": round(success_count / checks * 100, 2)})
-    try:
-        _save_local_json("uptime_history.json", history[-100:])
-        lines.append(f"Saved uptime runs: {min(len(history), 100)} (max 100)")
-    except OSError as exc:
-        lines.append(f"Could not save uptime history: {type(exc).__name__}")
-    section(f"Uptime history - {url}")
-    for line in lines:
-        print("  " + line)
-    return lines
-
-
-def diagnostic_profiles(profile, target):
-    profile = (profile or "").strip().lower()
-    target = (target or "").strip()
-    if profile not in {"basic", "web", "dns", "full"}:
-        return ["Error: choose Basic, Web, DNS, or Full"]
-    if not target:
-        return ["Error: target is required"]
-    try:
-        parsed = urlparse(target if "://" in target else "https://" + target)
-        _ = parsed.port
-    except ValueError:
-        return ["Error: invalid target URL"]
-    if parsed.scheme not in ("http", "https"):
-        return ["Error: use an HTTP/HTTPS URL or valid domain/IP"]
-    host = parsed.hostname or target
-    if not (validate_domain(host) or validate_ip(host)):
-        return ["Error: enter a valid domain, IP, or HTTP/HTTPS URL"]
-    lines = [f"Profile: {profile.title()}", f"Target: {target}",
-             f"Started: {datetime.datetime.now().isoformat()}"]
-    if profile == "basic":
-        if validate_ip(host):
-            lines.append(f"IP syntax: valid ({host})")
-        else:
-            try:
-                infos = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
-                addresses = list(dict.fromkeys(item[4][0] for item in infos))
-                lines.append("Resolved addresses: " + ", ".join(addresses[:8]))
-            except OSError as exc:
-                lines.append(f"DNS resolution failed: {type(exc).__name__}")
-    elif profile == "dns":
-        if not validate_domain(host):
-            return ["Error: DNS profile requires a domain name"]
-        lines.extend(dns_health_checker(host) or ["DNS health check returned no result"])
-    elif profile == "web":
-        url = normalize_url(target)
-        if not url:
-            return ["Error: Web profile requires an HTTP/HTTPS URL or valid domain"]
-        lines.extend(http_response_diagnostics(url) or ["HTTP diagnostics returned no result"])
-        lines.extend(security_headers_analyzer(url) or ["Security header check returned no result"])
-    else:
-        lines.extend(smart_diagnostic_report(target) or ["Smart diagnostic returned no result"])
-        if validate_domain(host):
-            lines.extend(dns_health_checker(host) or ["DNS health check returned no result"])
-        lines.extend(grab_https_cert(host) or ["TLS certificate check returned no result"])
-    lines.append("Profile note: presets use existing providers and bounded requests.")
-    section(f"Diagnostic profile - {profile}")
-    for line in lines:
-        print("  " + line)
-    return lines
-
-
-def shodan_internetdb(target):
-    kind, value = classify_target(target)
-    if kind == "invalid":
-        error(f"Invalid IP or domain: {target}")
-        return None
-    if kind == "domain":
-        try:
-            value = socket.gethostbyname(value)
-        except socket.gaierror:
-            error("Domain did not resolve to an IP.")
-            return None
-    parsed = parse_ip(value)
-    if not parsed:
-        error("Target is not a valid IP.")
-        return None
-    requests = _require("requests")
-    if not requests:
-        return None
-    info(f"Querying internetdb.shodan.io for {parsed}...")
-    try:
-        response = requests.get(f"https://internetdb.shodan.io/{parsed}",
-                                timeout=API_TIMEOUT,
-                                headers={"User-Agent": f"{TOOL_NAME}/{VERSION}"})
-        if response.status_code == 404:
-            warning("InternetDB has no observed data for this IP (this is not an error).")
-            lines = [f"IP: {parsed}", "No InternetDB observations recorded."]
-            section(f"InternetDB - {parsed}")
-            for line in lines:
-                print("  " + line)
-            return lines
-        response.raise_for_status()
-        data = response.json()
-    except requests.exceptions.RequestException as exc:
-        error(f"InternetDB request failed: {type(exc).__name__}")
-        return None
-    except ValueError:
-        error("InternetDB response was not JSON.")
-        return None
-    ports = data.get("ports", []) or []
-    hostnames = data.get("hostnames", []) or []
-    cpes = data.get("cpes", []) or []
-    tags = data.get("tags", []) or []
-    vulns = data.get("vulns", []) or []
-    lines = [
-        f"IP: {parsed}",
-        f"Open ports (observed): {', '.join(map(str, ports)) if ports else 'none'}",
-        f"Hostnames: {', '.join(hostnames) if hostnames else 'none'}",
-        f"CPEs: {', '.join(cpes[:10]) if cpes else 'none'}"
-        + (f" (...{len(cpes) - 10} more)" if len(cpes) > 10 else ""),
-        f"Tags: {', '.join(tags) if tags else 'none'}",
-        f"Known CVEs: {', '.join(vulns[:15]) if vulns else 'none'}"
-        + (f" (...{len(vulns) - 15} more)" if len(vulns) > 15 else ""),
-        "Source: internetdb.shodan.io (free, no key, public data)",
-        "Note: observations may be stale; treat as a starting point only.",
-    ]
-    section(f"InternetDB - {parsed}")
-    for line in lines:
-        print("  " + line)
-    return lines
-
-
-def port_banner_grab(target, ports=None):
-    parsed = parse_ip((target or "").strip())
-    if not parsed:
-        error("Enter a valid IP address for banner grab.")
-        return None
-    ports = ports or BANNER_PORTS
-    family = socket.AF_INET6 if parsed.version == 6 else socket.AF_INET
-    lines = []
-    info(f"Grabbing banners from {len(ports)} common port(s) on {parsed}...")
-    for port in ports:
-        if port == 443:
-            lines.append("Port 443: TLS - use TLS Certificate tool for inspection")
+        return emit("Batch Domains", [("Error", f"{len(unique)} domains > 50 max")], results)
+    rows = []
+    for domain in unique:
+        if not validate_domain(domain):
+            rows.append((domain, "INVALID"))
             continue
         try:
-            sock = socket.socket(family, socket.SOCK_STREAM)
-            sock.settimeout(2)
-            try:
-                if sock.connect_ex((str(parsed), port)) != 0:
-                    lines.append(f"Port {port}: closed/unreachable")
-                    continue
-                if port in (80, 8080):
-                    try:
-                        sock.sendall(f"HEAD / HTTP/1.0\r\nHost: {parsed}\r\n\r\n".encode())
-                    except OSError:
-                        pass
-                try:
-                    banner = sock.recv(512)
-                except socket.timeout:
-                    banner = b""
-                text_lines = banner.decode("utf-8", errors="replace").strip().splitlines()
-                snippet = " | ".join(line.strip() for line in text_lines[:3] if line.strip())
-                lines.append(f"Port {port}: {snippet or '(no banner returned)'}")
-            finally:
-                try:
-                    sock.close()
-                except Exception:
-                    pass
-        except OSError as exc:
-            lines.append(f"Port {port}: error ({type(exc).__name__})")
-    section(f"Port banner grab - {parsed}")
-    for line in lines:
-        print("  " + line)
-    return lines
+            resp = dns_resolve(domain, "A")
+            addrs = [rr["value"] for rr in resp["answers"] if rr["type"] == 1]
+            rows.append((domain, ", ".join(addrs) if addrs else resp["rcode_name"]))
+        except DNSError as exc:
+            rows.append((domain, f"error: {exc}"))
+    return emit(f"Batch Domains - {len(unique)} lines", rows, results)
 
 
-def dns_zone_transfer(domain):
-    dns = _require("dns")
-    if not dns:
-        return None
+def tool_37_email_deep(domain, results):
     if not validate_domain(domain):
-        error(f"Invalid domain: {domain}")
-        return None
-    import dns.resolver
-    import dns.query
-    import dns.zone
-    import dns.exception
-
-    info(f"Fetching NS records for {domain}...")
+        return emit("Email DNS Deep", [("Error", f"invalid domain: {domain}")], results)
+    rows = []
     try:
-        ns_answer = dns.resolver.resolve(domain, "NS", lifetime=DNS_TIMEOUT)
-        nameservers = [rdata.target.to_text().rstrip(".") for rdata in ns_answer]
+        mx = [rr["value"] for rr in dns_resolve(domain, "MX")["answers"] if rr["type"] == 15]
+        rows.append(("MX", f"{len(mx)} record(s)"))
+        rows.extend(("", m) for m in mx[:5])
+    except DNSError as exc:
+        rows.append(("MX", f"error: {exc}"))
+    try:
+        spf = [t for t in _dns_txt(domain) if t.lower().startswith("v=spf1")]
+        rows.append(("SPF", spf[0] if spf else "not found"))
+    except DNSError as exc:
+        rows.append(("SPF", f"error: {exc}"))
+    try:
+        dmarc = [t for t in _dns_txt(f"_dmarc.{domain}") if "v=dmarc1" in t.lower()]
+        rows.append(("DMARC", dmarc[0] if dmarc else "not found"))
+    except DNSError as exc:
+        rows.append(("DMARC", f"error: {exc}"))
+    for selector in ("default", "selector1", "selector2", "google", "k1", "mail"):
+        try:
+            recs = _dns_txt(f"{selector}._domainkey.{domain}")
+            rows.append((f"DKIM {selector}", recs[0][:80] if recs else "not found"))
+        except DNSError:
+            rows.append((f"DKIM {selector}", "lookup error"))
+    return emit(f"Email DNS Deep - {domain}", rows, results)
+
+
+def tool_38_config_validator(results):
+    rows = [
+        ("Tool", f"{TOOL_NAME} v{VERSION}"),
+        ("Author", AUTHOR),
+        ("Python", sys.version.split()[0]),
+        ("Platform", sys.platform),
+        ("OpenSSL", ssl.OPENSSL_VERSION),
+        ("DNS timeout", f"{DNS_TIMEOUT}s"),
+        ("HTTP timeout", f"{HTTP_TIMEOUT}s"),
+        ("Port timeout", f"{PORT_TIMEOUT}s"),
+        ("Nameservers", ", ".join(_system_nameservers()) or "1.1.1.1 fallback"),
+        ("Traceroute", _traceroute_capability()),
+    ]
+    try:
+        d = _local_data_dir()
+        os.makedirs(d, mode=0o700, exist_ok=True)
+        probe = os.path.join(d, ".write-test")
+        with open(probe, "w") as fh:
+            fh.write("ok")
+        os.remove(probe)
+        rows.append(("Data dir write", f"OK ({d})"))
+    except OSError as exc:
+        rows.append(("Data dir write", f"FAILED ({type(exc).__name__})"))
+    return emit("Configuration", rows, results)
+
+
+def tool_39_uptime(target, checks, interval, results):
+    url = normalize_url(target)
+    if not url:
+        return emit("Uptime History", [("Error", f"invalid URL: {target}")], results)
+    try:
+        checks = int(checks or 3)
+        interval = float(interval or 5)
+    except (TypeError, ValueError):
+        return emit("Uptime History", [("Error", "invalid checks/interval")], results)
+    if not (1 <= checks <= 30 and 5 <= interval <= 60):
+        return emit("Uptime History", [("Error", "checks 1-30, interval 5-60s")], results)
+    observations = []
+    for i in range(checks):
+        started = time.perf_counter()
+        status = None
+        ok_flag = False
+        error_name = None
+        try:
+            resp = http_request("GET", url, allow_redirects=False, read_limit=512, timeout=5)
+            status = resp["status"]
+            ok_flag = status < 500
+        except Exception as exc:
+            error_name = type(exc).__name__
+        elapsed = (time.perf_counter() - started) * 1000
+        observations.append({"ts": datetime.datetime.now().isoformat(), "ok": ok_flag,
+                             "status": status, "latency_ms": round(elapsed, 1),
+                             "error": error_name})
+        print(f"  [{i+1}/{checks}] {'UP' if ok_flag else 'DOWN'} "
+              f"status={status} {elapsed:.0f}ms")
+        if i + 1 < checks:
+            time.sleep(interval)
+    ok_count = sum(1 for o in observations if o["ok"])
+    rows = [
+        ("Target", url),
+        ("Checks", str(checks)),
+        ("Reachable", f"{ok_count}/{checks}"),
+        ("Availability", f"{ok_count/checks*100:.1f}%"),
+    ]
+    history = _load_json("uptime_history.json", [])
+    history.append({"created_at": datetime.datetime.now().isoformat(),
+                    "target": url, "checks": observations})
+    try:
+        _save_json("uptime_history.json", history[-100:])
+        rows.append(("History", f"saved ({min(len(history), 100)} runs retained)"))
+    except OSError as exc:
+        rows.append(("History", f"save failed ({type(exc).__name__})"))
+    return emit(f"Uptime History - {url}", rows, results)
+
+
+def tool_40_profiles(profile, target, results):
+    profile = (profile or "basic").strip().lower()
+    if profile not in {"basic", "web", "dns", "full"}:
+        return emit("Profile", [("Error", "choose basic/web/dns/full")], results)
+    kind, value = classify_target(target)
+    if kind == "invalid":
+        return emit("Profile", [("Error", f"invalid target: {target}")], results)
+    rows = [("Profile", profile), ("Target", value)]
+    if profile in ("basic", "full"):
+        try:
+            if kind == "domain":
+                addrs = [rr["value"] for rr in dns_resolve(value, "A")["answers"] if rr["type"] == 1]
+                rows.append(("DNS A", ", ".join(addrs) if addrs else "none"))
+            else:
+                rows.append(("IP", value))
+        except DNSError as exc:
+            rows.append(("DNS A", f"error: {exc}"))
+    if profile == "dns":
+        if kind == "ip":
+            rows.append(("DNS profile", "requires a domain, not an IP"))
+        else:
+            for rtype in ("A", "AAAA", "MX", "NS"):
+                try:
+                    resp = dns_resolve(value, rtype)
+                    cnt = sum(1 for rr in resp["answers"]
+                              if rr["type"] == DNS_TYPE_CODES[rtype])
+                    rows.append((rtype, f"{cnt} record(s) — {resp['rcode_name']}"))
+                except DNSError as exc:
+                    rows.append((rtype, f"error: {exc}"))
+    if profile in ("web", "full") and kind in ("domain", "ip"):
+        try:
+            resp = http_request("GET", f"https://{value}", read_limit=512)
+            rows.append(("HTTPS", f"{resp['status']} {resp['reason']}"))
+            for h in ("strict-transport-security", "content-security-policy"):
+                rows.append((h, resp["headers"].get(h, ["MISSING"])[0]))
+        except Exception as exc:
+            rows.append(("HTTPS", f"error: {type(exc).__name__}"))
+    return emit(f"Profile - {profile}", rows, results)
+
+
+def tool_41_web_ip(url, results):
+    url = normalize_url(url)
+    if not url:
+        return emit("Web IP Checker", [("Error", f"invalid URL: {url}")], results)
+    parsed = urlparse(url)
+    host = parsed.hostname
+    rows = [("URL", url), ("Hostname", host or "?")]
+    try:
+        addrs = [i[4][0] for i in socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)]
+        addrs = list(dict.fromkeys(addrs))
+    except socket.gaierror:
+        rows.append(("Error", "resolution failed"))
+        return emit(f"Web IP Checker - {host}", rows, results)
+    ipv4 = [a for a in addrs if ":" not in a]
+    ipv6 = [a for a in addrs if ":" in a]
+    rows.extend(("IPv4", a) for a in ipv4[:10])
+    rows.extend(("IPv6", a) for a in ipv6[:5])
+    rows.append(("Note", "may be CDN/proxy/load-balancer addresses"))
+    return emit(f"Web IP Checker - {host}", rows, results)
+
+
+def tool_42_internetdb(target, results):
+    kind, value = classify_target(target)
+    if kind == "invalid":
+        return emit("InternetDB", [("Error", f"invalid target: {target}")], results)
+    if kind == "domain":
+        try:
+            addrs = [rr["value"] for rr in dns_resolve(value, "A")["answers"] if rr["type"] == 1]
+            if not addrs:
+                return emit("InternetDB", [("Error", f"{value} did not resolve")], results)
+            value = addrs[0]
+        except DNSError as exc:
+            return emit("InternetDB", [("Error", str(exc))], results)
+    try:
+        resp = http_request("GET", f"https://internetdb.shodan.io/{value}", read_limit=1024 * 1024)
     except Exception as exc:
-        error(f"Could not get NS records: {type(exc).__name__}")
-        return None
+        return emit("InternetDB", [("Error", f"{type(exc).__name__}: {exc}")], results)
+    if resp["status"] == 404:
+        return emit(f"InternetDB - {value}", [("Result", "no observations recorded")], results)
+    if resp["status"] != 200:
+        return emit("InternetDB", [("Error", f"HTTP {resp['status']}")], results)
+    try:
+        data = json.loads(resp["body"].decode("utf-8", "replace"))
+    except json.JSONDecodeError:
+        return emit("InternetDB", [("Error", "invalid JSON")], results)
+    ports = data.get("ports") or []
+    hosts = data.get("hostnames") or []
+    cpes = data.get("cpes") or []
+    vulns = data.get("vulns") or []
+    rows = [
+        ("IP", value),
+        ("Ports", ", ".join(map(str, ports)) if ports else "none"),
+        ("Hostnames", ", ".join(hosts) if hosts else "none"),
+        ("CPEs", ", ".join(cpes[:8]) if cpes else "none"),
+        ("CVEs", ", ".join(vulns[:10]) if vulns else "none"),
+        ("Source", "internetdb.shodan.io"),
+    ]
+    return emit(f"InternetDB - {value}", rows, results)
+
+
+def tool_43_banner(ip, results):
+    parsed = parse_ip(ip)
+    if not parsed:
+        return emit("Banner Grab", [("Error", f"invalid IP: {ip}")], results)
+    rows = []
+    for port in BANNER_PORTS:
+        if port == 443:
+            rows.append((str(port), "TLS — use TLS Certificate tool"))
+            continue
+        banner = banner_grab(str(parsed), port)
+        if banner is None:
+            rows.append((str(port), "closed/unreachable"))
+        elif not banner:
+            rows.append((str(port), "(no banner returned)"))
+        else:
+            first = " | ".join(line.strip() for line in banner.splitlines()[:2] if line.strip())
+            rows.append((str(port), first[:120] or "(empty)"))
+    return emit(f"Banner Grab - {parsed}", rows, results)
+
+
+def tool_44_zone_transfer(domain, results):
+    if not validate_domain(domain):
+        return emit("Zone Transfer", [("Error", f"invalid domain: {domain}")], results)
+    try:
+        ns_resp = dns_resolve(domain, "NS")
+        nameservers = [rr["value"] for rr in ns_resp["answers"] if rr["type"] == 2]
+    except DNSError as exc:
+        return emit("Zone Transfer", [("Error", f"NS lookup failed: {exc}")], results)
     if not nameservers:
-        warning("No NS records found.")
-        return None
-    lines = []
+        return emit("Zone Transfer", [("Result", "no NS records")], results)
+    rows = []
     for ns in nameservers:
         try:
             ns_ip = socket.gethostbyname(ns)
         except socket.gaierror:
-            lines.append(f"{ns}: could not resolve")
+            rows.append((ns, "could not resolve"))
             continue
         try:
-            zone = dns.zone.from_xfr(dns.query.xfr(ns_ip, domain, timeout=3))
-            records = []
-            for name, node in zone.nodes.items():
-                for rdataset in node.rdatasets:
-                    for rdata in rdataset:
-                        records.append(f"{name}.{domain} {rdataset.rdtype} {rdata}")
-            if records:
-                lines.append(f"{ns} ({ns_ip}): TRANSFER SUCCEEDED - {len(records)} records")
-                lines.extend(f"  {r}" for r in records[:20])
-                if len(records) > 20:
-                    lines.append(f"  (...{len(records) - 20} more)")
-            else:
-                lines.append(f"{ns} ({ns_ip}): transfer succeeded but empty")
-        except dns.exception.DNSException as exc:
-            lines.append(f"{ns} ({ns_ip}): refused/failed ({type(exc).__name__})")
-        except Exception as exc:
-            lines.append(f"{ns} ({ns_ip}): error ({type(exc).__name__})")
-    lines.append("Note: AXFR is refused by most modern servers; success implies a misconfiguration.")
-    section(f"DNS zone transfer - {domain}")
-    for line in lines:
-        print("  " + line)
-    return lines
+            records = dns_axfr(ns_ip, domain)
+            rows.append((f"{ns} ({ns_ip})", f"TRANSFER OK — {len(records)} records"))
+            for rr in records[:15]:
+                rows.append(("", f"{rr['name']} {rr['type_name']} {rr['value']}"))
+        except (DNSError, OSError) as exc:
+            rows.append((f"{ns} ({ns_ip})", f"refused/failed ({type(exc).__name__})"))
+    rows.append(("Note", "AXFR success implies a misconfiguration"))
+    return emit(f"Zone Transfer - {domain}", rows, results)
 
 
-def cname_chain_tracer(domain):
-    dns = _require("dns")
-    if not dns:
-        return None
+def tool_45_cname_chain(domain, results):
     if not validate_domain(domain):
-        error(f"Invalid domain: {domain}")
-        return None
-    import dns.resolver
-    chain = []
+        return emit("CNAME Chain", [("Error", f"invalid domain: {domain}")], results)
+    rows = []
     current = domain.rstrip(".")
     seen = set()
     for _ in range(10):
         if current in seen:
-            chain.append(f"{current} (loop detected)")
+            rows.append(("", f"{current} (loop)"))
             break
         seen.add(current)
         try:
-            answer = dns.resolver.resolve(current, "CNAME", lifetime=DNS_TIMEOUT)
-            target = str(list(answer)[0].target).rstrip(".")
-            chain.append(f"{current} -> {target}")
-            current = target
-        except dns.resolver.NoAnswer:
-            chain.append(f"{current} (end of chain)")
+            resp = dns_resolve(current, "CNAME")
+        except DNSError as exc:
+            rows.append(("", f"{current} (error: {exc})"))
             break
-        except dns.resolver.NXDOMAIN:
-            chain.append(f"{current} (NXDOMAIN)")
+        cnames = [rr["value"] for rr in resp["answers"] if rr["type"] == 5]
+        if cnames:
+            rows.append(("", f"{current} -> {cnames[0]}"))
+            current = cnames[0]
+        else:
+            rows.append(("", f"{current} (end — {resp['rcode_name']})"))
             break
-        except dns.resolver.LifetimeTimeout:
-            chain.append(f"{current} (timeout)")
-            break
-        except Exception as exc:
-            chain.append(f"{current} (error: {type(exc).__name__})")
-            break
-    section(f"CNAME chain - {domain}")
-    for line in chain:
-        print("  " + line)
-    return chain
+    return emit(f"CNAME Chain - {domain}", rows, results)
 
 
-def tls_san_extractor(target):
+def tool_46_tls_sans(target, results):
     kind, value = classify_target(target)
     if kind == "invalid":
-        error(f"Invalid domain or IP: {target}")
-        return None
-    cert = None
+        return emit("TLS SANs", [("Error", f"invalid target: {target}")], results)
+    if kind == "ip":
+        return emit("TLS SANs", [("Error", "requires a hostname (SNI)")], results)
     try:
-        info(f"Fetching certificate from {value}:443...")
-        context = ssl.create_default_context()
-        with socket.create_connection((value, 443), timeout=API_TIMEOUT) as sock:
-            with context.wrap_socket(sock, server_hostname=value) as ssock:
-                cert = ssock.getpeercert()
-    except ssl.SSLCertVerificationError as exc:
-        error(f"Certificate verification failed: {exc.reason if hasattr(exc, 'reason') else exc}")
-        return None
-    except socket.timeout:
-        error("TLS handshake timed out.")
-        return None
+        cert_info = tls_fetch_cert(value)
     except Exception as exc:
-        error(f"TLS fetch failed: {type(exc).__name__}")
-        return None
-    if not cert:
-        error("No certificate returned.")
-        return None
-    subject = dict(item[0] for item in cert.get("subject", ()))
-    issuer = dict(item[0] for item in cert.get("issuer", ()))
-    san_entries = cert.get("subjectAltName", ())
-    san_names = [san_value for kind_val, san_value in san_entries if kind_val == "DNS"]
-    san_ips = [san_value for kind_val, san_value in san_entries if kind_val == "IP Address"]
-    lines = [
-        f"Subject CN: {subject.get('commonName', 'N/A')}",
-        f"Issuer: {issuer.get('organizationName', issuer.get('commonName', 'N/A'))}",
-        f"Valid from: {cert.get('notBefore', 'N/A')}",
-        f"Valid to: {cert.get('notAfter', 'N/A')}",
-        f"SAN DNS names: {len(san_names)}",
-        *[f"  {name}" for name in san_names],
-    ]
-    if san_ips:
-        lines.append(f"SAN IP addresses: {len(san_ips)}")
-        lines.extend(f"  {ip}" for ip in san_ips)
-    section(f"TLS SANs - {value}")
-    for line in lines:
-        print("  " + line)
-    return lines
+        return emit("TLS SANs", [("Error", f"{type(exc).__name__}: {exc}")], results)
+    cert = cert_info["cert"]
+    san = cert.get("subjectAltName", ())
+    dns_names = [v for t, v in san if t == "DNS"]
+    ip_addrs = [v for t, v in san if t == "IP Address"]
+    rows = [("DNS SANs", str(len(dns_names)))]
+    rows.extend(("", n) for n in dns_names)
+    if ip_addrs:
+        rows.append(("IP SANs", str(len(ip_addrs))))
+        rows.extend(("", ip) for ip in ip_addrs)
+    return emit(f"TLS SANs - {value}", rows, results)
 
 
-def reverse_ip_lookup(target):
+def tool_47_reverse_ip(target, results):
     kind, value = classify_target(target)
     if kind == "invalid":
-        error(f"Invalid IP or domain: {target}")
-        return None
+        return emit("Reverse IP", [("Error", f"invalid target: {target}")], results)
     if kind == "domain":
         try:
-            value = socket.gethostbyname(value)
-        except socket.gaierror:
-            error("Domain did not resolve.")
-            return None
-    parsed = parse_ip(value)
-    if not parsed or parsed.version != 4:
-        error("Reverse IP requires a valid IPv4 address.")
-        return None
-    requests = _require("requests")
-    if not requests:
-        return None
-    info(f"Querying reverse-IP hosts for {parsed} (hackertarget, free tier)...")
+            addrs = [rr["value"] for rr in dns_resolve(value, "A")["answers"] if rr["type"] == 1]
+            if not addrs:
+                return emit("Reverse IP", [("Error", f"{value} did not resolve")], results)
+            value = addrs[0]
+        except DNSError as exc:
+            return emit("Reverse IP", [("Error", str(exc))], results)
+    if not validate_ip(value) or ":" in value:
+        return emit("Reverse IP", [("Error", "requires IPv4")], results)
     try:
-        response = requests.get(
-            "https://api.hackertarget.com/reverseiplookup/",
-            params={"q": str(parsed)},
-            timeout=API_TIMEOUT,
-            headers={"User-Agent": f"{TOOL_NAME}/{VERSION}"},
+        resp = http_request(
+            "GET",
+            f"https://api.hackertarget.com/reverseiplookup/?q={value}",
+            read_limit=512 * 1024,
         )
-        response.raise_for_status()
-        text = response.text.strip()
-    except requests.exceptions.RequestException as exc:
-        error(f"Reverse IP failed: {type(exc).__name__}")
-        return None
-    lowered = text.lower()[:80]
-    if "api count exceeded" in lowered or ("error" in lowered[:30] and len(text) < 200):
-        error(f"Provider response: {text[:160]}")
-        return [f"Provider error: {text[:200]}"]
-    hosts = [h.strip() for h in text.splitlines() if h.strip() and not h.strip().startswith("No")]
-    lines = [f"IP: {parsed}", f"Hosts found: {len(hosts)}"]
-    lines.extend(hosts[:50])
+    except Exception as exc:
+        return emit("Reverse IP", [("Error", f"{type(exc).__name__}: {exc}")], results)
+    text = resp["body"].decode("utf-8", "replace").strip()
+    low = text.lower()
+    if "api count exceeded" in low or low.startswith("error"):
+        return emit("Reverse IP", [("Provider", text[:200])], results)
+    hosts = [h.strip() for h in text.splitlines() if h.strip()]
+    rows = [("IP", value), ("Hosts", str(len(hosts)))]
+    rows.extend(("", h) for h in hosts[:50])
     if len(hosts) > 50:
-        lines.append(f"... {len(hosts) - 50} more host(s) hidden")
-    lines.append("Source: hackertarget.com (free tier, rate-limited)")
-    section(f"Reverse IP - {parsed}")
-    for line in lines:
-        print("  " + line)
-    return lines
+        rows.append(("", f"...{len(hosts) - 50} more"))
+    rows.append(("Source", "hackertarget.com (free tier)"))
+    return emit(f"Reverse IP - {value}", rows, results)
 
 
-def security_txt_check(target):
+def tool_48_security_txt(target, results):
     url = normalize_url(target)
     if not url:
-        error("Invalid target.")
-        return None
+        return emit("Security.txt", [("Error", f"invalid URL: {target}")], results)
     parsed = urlparse(url)
-    scheme = parsed.scheme
-    host = parsed.netloc or parsed.hostname
-    if not host:
-        error("Could not extract host.")
-        return None
-    requests = _require("requests")
-    if not requests:
-        return None
-    paths = ["/.well-known/security.txt", "/security.txt", "/robots.txt", "/sitemap.xml"]
-    lines = []
-    info(f"Fetching well-known files from {host}...")
-    for path in paths:
-        test_url = f"{scheme}://{host}{path}"
+    base = f"{parsed.scheme}://{parsed.netloc}"
+    rows = []
+    for path in ("/.well-known/security.txt", "/security.txt", "/robots.txt", "/sitemap.xml"):
         try:
-            response = requests.get(test_url, timeout=API_TIMEOUT, allow_redirects=True,
-                                    headers={"User-Agent": f"{TOOL_NAME}/{VERSION}"})
-            body = response.text or ""
-            if response.status_code == 200 and body.strip():
-                first = body.strip().splitlines()[0][:120]
-                lines.append(f"{path}: {response.status_code} ({len(body)} bytes) - {first}")
-            else:
-                lines.append(f"{path}: {response.status_code} ({len(body)} bytes)")
-        except requests.exceptions.RequestException as exc:
-            lines.append(f"{path}: failed ({type(exc).__name__})")
-    lines.append("Note: presence of files is informational; absence is not a vulnerability.")
-    section(f"Well-known files - {host}")
-    for line in lines:
-        print("  " + line)
-    return lines
+            resp = http_request("GET", base + path, read_limit=8192)
+            size = len(resp["body"])
+            preview = resp["body"].decode("utf-8", "replace").splitlines()[:1]
+            preview_text = preview[0][:80] if preview else ""
+            rows.append((path, f"{resp['status']} ({size} bytes) {preview_text}"))
+        except Exception as exc:
+            rows.append((path, f"error: {type(exc).__name__}"))
+    rows.append(("Note", "presence only — absence is not a vulnerability"))
+    return emit(f"Security.txt - {parsed.netloc}", rows, results)
 
 
-def bulk_geo_lookup(domain):
+def tool_49_bulk_geo(domain, results):
     if not validate_domain(domain):
-        error(f"Invalid domain: {domain}")
-        return None
+        return emit("Bulk Geo", [("Error", f"invalid domain: {domain}")], results)
     try:
         infos = socket.getaddrinfo(domain, None, type=socket.SOCK_STREAM)
-        ips = sorted({item[4][0] for item in infos})
+        addrs = list(dict.fromkeys(i[4][0] for i in infos))
     except socket.gaierror:
-        error("Domain did not resolve.")
-        return None
-    if not ips:
-        warning("No IPs returned.")
-        return None
-    requests = _require("requests")
-    if not requests:
-        return None
-    info(f"Geolocating up to {min(len(ips), 8)} IP(s) for {domain}...")
-    lines = [f"Domain: {domain}", f"Addresses: {len(ips)}"]
-    for ip in ips[:8]:
+        return emit("Bulk Geo", [("Error", "resolution failed")], results)
+    rows = [("Domain", domain), ("Addresses", str(len(addrs)))]
+    for ip in addrs[:8]:
         try:
-            response = requests.get(f"https://ipwho.is/{ip}", timeout=API_TIMEOUT,
-                                    headers={"User-Agent": f"{TOOL_NAME}/{VERSION}"})
-            response.raise_for_status()
-            data = response.json()
-            if not data.get("success"):
-                lines.append(f"{ip}: no data")
-                continue
-            country = data.get("country", "?")
-            city = data.get("city", "?")
-            conn = data.get("connection") or {}
-            lines.append(f"{ip}: {country} / {city} - {conn.get('isp', '?')}")
+            data, _ = http_get_json(f"https://ipwho.is/{ip}")
+            if data.get("success"):
+                conn = data.get("connection") or {}
+                rows.append((ip, f"{data.get('country', '?')} / {data.get('city', '?')} — {conn.get('isp', '?')}"))
+            else:
+                rows.append((ip, "no data"))
         except Exception as exc:
-            lines.append(f"{ip}: error ({type(exc).__name__})")
-    if len(ips) > 8:
-        lines.append(f"({len(ips) - 8} additional IP(s) not geolocated - bounded per run)")
-    lines.append("Source: ipwho.is (HTTPS, community)")
-    section(f"Bulk geolocation - {domain}")
-    for line in lines:
-        print("  " + line)
-    return lines
+            rows.append((ip, f"error: {type(exc).__name__}"))
+    if len(addrs) > 8:
+        rows.append(("", f"{len(addrs) - 8} more not geolocated (bounded to 8)"))
+    return emit(f"Bulk Geo - {domain}", rows, results)
 
 
-# ---- Recon extended (50-59) ----
-
-def dnsbl_check(ip):
-    parsed = parse_ip((ip or "").strip())
-    if not parsed or parsed.version != 4:
-        error("DNSBL check requires a valid IPv4 address.")
-        return None
-    if not parsed.is_global:
-        error("Enter a public (globally-routable) IPv4 address.")
-        return None
-    dns = _require("dns")
-    if not dns:
-        return None
-    import dns.resolver
-    lists = [
+def tool_50_dnsbl(ip, results):
+    parsed = parse_ip(ip)
+    if not parsed or parsed.version != 4 or not parsed.is_global:
+        return emit("DNSBL", [("Error", "requires a public IPv4")], results)
+    reversed_octets = ".".join(reversed(str(parsed).split(".")))
+    zones = [
         ("Spamhaus ZEN", "zen.spamhaus.org"),
         ("SpamCop", "bl.spamcop.net"),
         ("Barracuda", "b.barracudacentral.org"),
@@ -2609,116 +2355,71 @@ def dnsbl_check(ip):
         ("PSBL", "psbl.surriel.com"),
         ("UCEPROTECT L1", "dnsbl-1.uceprotect.net"),
     ]
-    reversed_octets = ".".join(reversed(str(parsed).split(".")))
-    lines = [f"IP: {parsed}"]
-    info(f"Checking {parsed} against {len(lists)} DNSBL(s)...")
-    for label, zone in lists:
-        query = f"{reversed_octets}.{zone}"
+    rows = []
+    for label, zone in zones:
         try:
-            answers = dns.resolver.resolve(query, "A", lifetime=DNS_TIMEOUT)
-            codes = [rdata.to_text() for rdata in answers]
-            lines.append(f"{label:<16}: LISTED ({', '.join(codes)})")
-        except dns.resolver.NXDOMAIN:
-            lines.append(f"{label:<16}: clean")
-        except dns.resolver.LifetimeTimeout:
-            lines.append(f"{label:<16}: timeout (unknown)")
-        except dns.resolver.NoAnswer:
-            lines.append(f"{label:<16}: no answer (inconclusive)")
-        except Exception as exc:
-            lines.append(f"{label:<16}: error ({type(exc).__name__})")
-    lines.append("Note: DNSBL listing does not imply malicious activity; verify before reporting.")
-    section(f"DNSBL check - {parsed}")
-    for line in lines:
-        print("  " + line)
-    return lines
+            resp = dns_resolve(f"{reversed_octets}.{zone}", "A")
+            addrs = [rr["value"] for rr in resp["answers"] if rr["type"] == 1]
+            if addrs:
+                rows.append((label, f"LISTED ({', '.join(addrs)})"))
+            elif resp["rcode"] == 3:
+                rows.append((label, "clean (NXDOMAIN)"))
+            else:
+                rows.append((label, f"inconclusive ({resp['rcode_name']})"))
+        except DNSError as exc:
+            rows.append((label, f"error: {exc}"))
+    rows.append(("Note", "listing is not proof of abuse"))
+    return emit(f"DNSBL - {parsed}", rows, results)
 
 
-def wayback_lookup(target):
-    requests = _require("requests")
-    if not requests:
-        return None
+def tool_51_wayback(target, results):
     url = normalize_url(target)
     if not url:
-        error("Invalid target URL.")
-        return None
-    info("Querying Wayback Machine...")
+        return emit("Wayback", [("Error", f"invalid URL: {target}")], results)
+    from urllib.parse import quote
     try:
-        response = requests.get(
-            "https://archive.org/wayback/available",
-            params={"url": url},
-            timeout=API_TIMEOUT,
-            headers={"User-Agent": f"{TOOL_NAME}/{VERSION}"},
-        )
-        response.raise_for_status()
-        data = response.json()
+        data, _ = http_get_json(f"https://archive.org/wayback/available?url={quote(url, safe='')}")
     except Exception as exc:
-        error(f"Wayback lookup failed: {type(exc).__name__}")
-        return [f"Lookup error: {type(exc).__name__}"]
-    snapshot = (data.get("archived_snapshots") or {}).get("closest")
-    lines = [f"Target URL: {url}"]
-    if snapshot and snapshot.get("available"):
-        lines.extend([
-            f"Latest snapshot: {snapshot.get('timestamp', 'N/A')}",
-            f"Snapshot URL: {snapshot.get('url', 'N/A')}",
-            f"Snapshot status: {snapshot.get('status', 'N/A')}",
-        ])
+        return emit("Wayback", [("Error", f"{type(exc).__name__}: {exc}")], results)
+    snap = (data.get("archived_snapshots") or {}).get("closest")
+    rows = [("Target", url)]
+    if snap and snap.get("available"):
+        rows.append(("Timestamp", snap.get("timestamp", "?")))
+        rows.append(("URL", snap.get("url", "?")))
+        rows.append(("Status", snap.get("status", "?")))
     else:
-        lines.append("No archived snapshot returned for this exact URL.")
-        lines.append("Try the base domain or a different path.")
-    lines.append("Source: archive.org/wayback/available (free, no key)")
-    section(f"Wayback Machine - {url}")
-    for line in lines:
-        print("  " + line)
-    return lines
+        rows.append(("Result", "no archived snapshot"))
+    rows.append(("Source", "archive.org"))
+    return emit(f"Wayback - {url}", rows, results)
 
 
-def bgp_prefix_lookup(target):
-    parsed = parse_ip((target or "").strip())
+def tool_52_bgp(target, results):
+    parsed = parse_ip(target)
     if not parsed:
-        error("Enter a valid IP address.")
-        return None
-    requests = _require("requests")
-    if not requests:
-        return None
-    info(f"Querying RIPEstat for {parsed}...")
+        return emit("BGP Prefix", [("Error", f"invalid IP: {target}")], results)
     try:
-        response = requests.get(
-            "https://stat.ripe.net/data/prefix-overview/data.json",
-            params={"resource": str(parsed)},
-            timeout=API_TIMEOUT,
-            headers={"User-Agent": f"{TOOL_NAME}/{VERSION}"},
-        )
-        response.raise_for_status()
-        data = response.json()
+        data, _ = http_get_json(
+            f"https://stat.ripe.net/data/prefix-overview/data.json?resource={parsed}")
     except Exception as exc:
-        error(f"RIPEstat lookup failed: {type(exc).__name__}")
-        return [f"Lookup error: {type(exc).__name__}"]
+        return emit("BGP Prefix", [("Error", f"{type(exc).__name__}: {exc}")], results)
     payload = data.get("data") or {}
     asns = payload.get("asns") or []
-    lines = [f"IP: {parsed}", f"Announced prefix: {payload.get('prefix', 'N/A')}",
-             f"AS count: {len(asns)}"]
+    rows = [("IP", str(parsed)), ("Prefix", payload.get("prefix", "?"))]
     for asn in asns[:6]:
-        lines.append(f"  AS{asn.get('asn', '?')} - {asn.get('holder', '?')}")
-    if len(asns) > 6:
-        lines.append(f"  (...{len(asns) - 6} more)")
-    lines.append("Source: stat.ripe.net (free, no key)")
-    section(f"BGP prefix - {parsed}")
-    for line in lines:
-        print("  " + line)
-    return lines
+        rows.append((f"AS{asn.get('asn', '?')}", asn.get("holder", "?")))
+    rows.append(("Source", "stat.ripe.net"))
+    return emit(f"BGP Prefix - {parsed}", rows, results)
 
 
-def team_cymru_asn(target):
-    parsed = parse_ip((target or "").strip())
+def tool_53_cymru_asn(target, results):
+    parsed = parse_ip(target)
     if not parsed:
-        error("Enter a valid IP address.")
-        return None
+        return emit("Team Cymru ASN", [("Error", f"invalid IP: {target}")], results)
     try:
-        info(f"Querying whois.cymru.com:43 for {parsed}...")
-        with socket.create_connection(("whois.cymru.com", 43), timeout=API_TIMEOUT) as sock:
+        with socket.create_connection(("whois.cymru.com", 43), timeout=WHOIS_TIMEOUT) as sock:
             sock.sendall(f" -v {parsed}\r\n".encode())
-            sock.settimeout(API_TIMEOUT)
-            response = b""
+            sock.settimeout(WHOIS_TIMEOUT)
+            data = b""
             while True:
                 try:
                     chunk = sock.recv(4096)
@@ -2726,379 +2427,241 @@ def team_cymru_asn(target):
                     break
                 if not chunk:
                     break
-                response += chunk
-                if len(response) > 65536:
+                data += chunk
+                if len(data) > 65536:
                     break
-        text = response.decode("utf-8", errors="replace").strip()
-    except Exception as exc:
-        error(f"Team Cymru lookup failed: {type(exc).__name__}")
-        return [f"Lookup error: {type(exc).__name__}"]
-    lines = [f"IP: {parsed}", "Raw response:"]
-    for raw_line in text.splitlines():
-        lines.append("  " + raw_line.strip())
-    lines.append("Source: whois.cymru.com:43 (free, no key)")
-    section(f"Team Cymru ASN - {parsed}")
-    for line in lines:
-        print("  " + line)
-    return lines
+    except OSError as exc:
+        return emit("Team Cymru ASN", [("Error", f"{type(exc).__name__}: {exc}")], results)
+    text = data.decode("utf-8", "replace").strip()
+    rows = [("IP", str(parsed))]
+    for ln in text.splitlines():
+        if ln.strip():
+            rows.append(("", ln.strip()))
+    rows.append(("Source", "whois.cymru.com:43"))
+    return emit(f"Team Cymru ASN - {parsed}", rows, results)
 
 
-def cookie_security_checker(target):
-    url = normalize_url(target)
+def tool_54_cookies(url, results):
+    url = normalize_url(url)
     if not url:
-        error("Invalid target URL.")
-        return None
-    requests = _require("requests")
-    if not requests:
-        return None
-    response = None
+        return emit("Cookie Security", [("Error", f"invalid URL: {url}")], results)
     try:
-        info("Fetching cookies from target...")
-        response = requests.get(url, timeout=API_TIMEOUT, allow_redirects=True,
-                                headers={"User-Agent": f"{TOOL_NAME}/{VERSION}"})
+        resp = http_request("GET", url, read_limit=512)
     except Exception as exc:
-        error(f"Request failed: {type(exc).__name__}")
-        return [f"Request error: {type(exc).__name__}"]
-    raw_headers = getattr(response.raw, "headers", None)
-    headers_list = []
-    try:
-        if raw_headers is not None and hasattr(raw_headers, "get_all"):
-            headers_list = raw_headers.get_all("Set-Cookie") or []
-        else:
-            single = response.headers.get("Set-Cookie", "")
-            if single:
-                headers_list = [single]
-    except Exception:
-        headers_list = []
-    lines = [f"URL: {response.url}", f"Set-Cookie headers observed: {len(headers_list)}"]
-    if not headers_list:
-        lines.append("No Set-Cookie headers returned on this response.")
-    else:
-        for header in headers_list:
-            if not header:
-                continue
-            parts = [p.strip() for p in header.split(";")]
-            name = parts[0].split("=", 1)[0] if parts else "?"
-            lowered = " ".join(parts[1:]).lower()
-            secure = "secure" in lowered
-            httponly = "httponly" in lowered
-            samesite = "not set"
-            for p in parts[1:]:
-                if p.lower().startswith("samesite="):
-                    samesite = p.split("=", 1)[1]
-                    break
-            lines.append(f"  {name}: {'Secure' if secure else 'NOT-Secure'}, "
-                         f"{'HttpOnly' if httponly else 'NOT-HttpOnly'}, SameSite={samesite}")
-    lines.append("Note: cookie flags are best-practice review signals, not direct vulnerabilities.")
-    response.close()
-    section(f"Cookie security - {url}")
-    for line in lines:
-        print("  " + line)
-    return lines
+        return emit("Cookie Security", [("Error", f"{type(exc).__name__}: {exc}")], results)
+    cookies = []
+    for k, v in resp["raw_headers"]:
+        if k.lower() == "set-cookie":
+            cookies.append(v)
+    rows = [("Status", str(resp["status"])), ("Cookies", str(len(cookies)))]
+    for cookie in cookies:
+        parts = [p.strip() for p in cookie.split(";")]
+        name = parts[0].split("=", 1)[0]
+        low = " ".join(parts[1:]).lower()
+        secure = "secure" in low
+        httponly = "httponly" in low
+        samesite = "not set"
+        for p in parts[1:]:
+            if p.lower().startswith("samesite="):
+                samesite = p.split("=", 1)[1]
+                break
+        rows.append((name, f"{'Secure' if secure else 'NOT-Secure'}, "
+                            f"{'HttpOnly' if httponly else 'NOT-HttpOnly'}, SameSite={samesite}"))
+    return emit(f"Cookie Security - {url}", rows, results)
 
 
-def cors_policy_checker(target):
-    url = normalize_url(target)
+def tool_55_cors(url, results):
+    url = normalize_url(url)
     if not url:
-        error("Invalid target URL.")
-        return None
-    requests = _require("requests")
-    if not requests:
-        return None
-    test_origin = "https://example.com"
+        return emit("CORS", [("Error", f"invalid URL: {url}")], results)
     try:
-        info(f"Sending Origin: {test_origin}...")
-        response = requests.get(url, timeout=API_TIMEOUT, allow_redirects=False,
-                                headers={"User-Agent": f"{TOOL_NAME}/{VERSION}",
-                                         "Origin": test_origin})
+        resp = http_request("GET", url, headers={"Origin": "https://example.com"},
+                            allow_redirects=False, read_limit=512)
     except Exception as exc:
-        error(f"Request failed: {type(exc).__name__}")
-        return [f"Request error: {type(exc).__name__}"]
-    acao = response.headers.get("Access-Control-Allow-Origin", "(not set)")
-    acac = response.headers.get("Access-Control-Allow-Credentials", "(not set)")
-    acam = response.headers.get("Access-Control-Allow-Methods", "(not set)")
-    acah = response.headers.get("Access-Control-Allow-Headers", "(not set)")
-    lines = [
-        f"URL: {url}",
-        f"HTTP status: {response.status_code}",
-        f"Origin tested: {test_origin}",
-        f"Access-Control-Allow-Origin: {acao}",
-        f"Access-Control-Allow-Credentials: {acac}",
-        f"Access-Control-Allow-Methods: {acam}",
-        f"Access-Control-Allow-Headers: {acah}",
+        return emit("CORS", [("Error", f"{type(exc).__name__}: {exc}")], results)
+    acao = resp["headers"].get("access-control-allow-origin", ["(not set)"])[0]
+    acac = resp["headers"].get("access-control-allow-credentials", ["(not set)"])[0]
+    rows = [
+        ("Status", str(resp["status"])),
+        ("ACAO", acao),
+        ("ACAC", acac),
+        ("ACAM", resp["headers"].get("access-control-allow-methods", ["(not set)"])[0]),
+        ("ACAH", resp["headers"].get("access-control-allow-headers", ["(not set)"])[0]),
     ]
     if acao == "*" and acac.lower() == "true":
-        warning("Wildcard origin with credentials - browsers reject this; still a misconfiguration.")
-    elif acao == "*":
-        lines.append("Note: wildcard CORS allows any origin to read public responses.")
-    elif acao == test_origin:
-        lines.append("Note: this test origin is explicitly allowed - review whether it should be.")
-    elif acao == "(not set)":
-        lines.append("Note: no CORS headers - browser same-origin policy applies.")
-    lines.append("Note: header inspection only; no authentication-bypass test performed.")
-    response.close()
-    section(f"CORS policy - {url}")
-    for line in lines:
-        print("  " + line)
-    return lines
+        rows.append(("Warning", "wildcard origin with credentials"))
+    return emit(f"CORS - {url}", rows, results)
 
 
-def wildcard_dns_checker(domain):
-    dns = _require("dns")
-    if not dns:
-        return None
+def tool_56_wildcard_dns(domain, results):
     if not validate_domain(domain):
-        error(f"Invalid domain: {domain}")
-        return None
-    import dns.resolver
-    random_label = "".join(random.choices(string.ascii_lowercase + string.digits, k=12))
-    probe = f"{random_label}.{domain}"
-    lines = [f"Domain: {domain}", f"Random probe: {probe}"]
-    info(f"Probing {probe}...")
+        return emit("Wildcard DNS", [("Error", f"invalid domain: {domain}")], results)
+    label = "".join(random.choices("abcdefghijklmnopqrstuvwxyz0123456789", k=12))
+    probe = f"{label}.{domain}"
     try:
-        answers = dns.resolver.resolve(probe, "A", lifetime=DNS_TIMEOUT)
-        addresses = [r.to_text() for r in answers]
-        lines.append(f"Wildcard: YES - resolved to {', '.join(addresses)}")
-        lines.append("Note: wildcard DNS answers any subdomain; brute-force enumeration must filter it.")
-    except dns.resolver.NXDOMAIN:
-        lines.append("Wildcard: NO - random subdomain returned NXDOMAIN")
-    except dns.resolver.NoAnswer:
-        lines.append("Wildcard: NO - no A record for random subdomain")
-    except dns.resolver.LifetimeTimeout:
-        lines.append("Wildcard: INCONCLUSIVE - query timed out")
-    except Exception as exc:
-        lines.append(f"Wildcard: INCONCLUSIVE ({type(exc).__name__})")
-    section(f"Wildcard DNS - {domain}")
-    for line in lines:
-        print("  " + line)
-    return lines
-
-
-def subdomain_takeover_checker(domain):
-    dns = _require("dns")
-    if not dns:
-        return None
-    if not validate_domain(domain):
-        error(f"Invalid domain: {domain}")
-        return None
-    requests = _require("requests")
-    if not requests:
-        return None
-    import dns.resolver
-    lines = [f"Domain: {domain}"]
-    info(f"Resolving CNAME for {domain}...")
-    cname_target = None
-    try:
-        answers = dns.resolver.resolve(domain, "CNAME", lifetime=DNS_TIMEOUT)
-        cname_target = str(list(answers)[0].target).rstrip(".")
-        lines.append(f"CNAME: {domain} -> {cname_target}")
-    except dns.resolver.NoAnswer:
-        lines.append("CNAME: none (A record or nothing)")
-    except dns.resolver.NXDOMAIN:
-        lines.append("CNAME: NXDOMAIN")
-        section(f"Subdomain takeover - {domain}")
-        for line in lines:
-            print("  " + line)
-        return lines
-    except dns.resolver.LifetimeTimeout:
-        lines.append("CNAME: timeout")
-    except Exception as exc:
-        lines.append(f"CNAME: error ({type(exc).__name__})")
-    if cname_target:
-        matches = [k for k in TAKEOVER_FINGERPRINTS if cname_target.endswith(k)]
-        if matches:
-            lines.append(f"CNAME target matches takeoverable service: {matches[0]}")
-            info(f"Fetching http://{domain} to confirm...")
-            try:
-                response = requests.get(f"http://{domain}", timeout=API_TIMEOUT,
-                                        headers={"User-Agent": f"{TOOL_NAME}/{VERSION}"})
-                body = response.text[:8192] if response.text else ""
-                fingerprint_list = TAKEOVER_FINGERPRINTS[matches[0]]
-                hit = next((fp for fp in fingerprint_list if fp in body), None)
-                if hit:
-                    lines.append(f"CONFIRMED: matched fingerprint '{hit}'")
-                else:
-                    lines.append("CNAME matches service, but body did not match a takeover fingerprint.")
-                response.close()
-            except Exception as exc:
-                lines.append(f"Fetch failed: {type(exc).__name__}")
-        else:
-            lines.append("No known-takeoverable fingerprint matched the CNAME target.")
-    lines.append("Note: takeover fingerprinting is best-effort; verify manually.")
-    section(f"Subdomain takeover - {domain}")
-    for line in lines:
-        print("  " + line)
-    return lines
-
-
-def basic_auth_checker(target):
-    url = normalize_url(target)
-    if not url:
-        error("Invalid target URL.")
-        return None
-    requests = _require("requests")
-    if not requests:
-        return None
-    try:
-        info("Requesting target without credentials...")
-        response = requests.get(url, timeout=API_TIMEOUT, allow_redirects=False,
-                                headers={"User-Agent": f"{TOOL_NAME}/{VERSION}"})
-    except Exception as exc:
-        error(f"Request failed: {type(exc).__name__}")
-        return [f"Request error: {type(exc).__name__}"]
-    auth_header = response.headers.get("WWW-Authenticate", "")
-    lines = [
-        f"URL: {url}",
-        f"HTTP status: {response.status_code}",
-        f"WWW-Authenticate: {auth_header or '(not set)'}",
-    ]
-    if response.status_code == 401:
-        lowered = auth_header.lower()
-        if lowered.startswith("basic"):
-            lines.append("Result: HTTP Basic authentication enforced on this path.")
-        elif lowered.startswith("digest"):
-            lines.append("Result: HTTP Digest authentication enforced.")
-        elif lowered.startswith("bearer"):
-            lines.append("Result: Bearer-token authentication required.")
-        else:
-            lines.append("Result: 401 without recognized scheme.")
-    elif response.status_code in (301, 302, 303, 307, 308):
-        lines.append("Result: redirect - follow manually to reach auth-gated endpoint.")
+        resp = dns_resolve(probe, "A")
+    except DNSError as exc:
+        return emit("Wildcard DNS", [("Error", str(exc))], results)
+    addrs = [rr["value"] for rr in resp["answers"] if rr["type"] == 1]
+    rows = [("Probe", probe)]
+    if addrs:
+        rows.append(("Result", f"WILDCARD detected -> {', '.join(addrs)}"))
+    elif resp["rcode"] == 3:
+        rows.append(("Result", "no wildcard (NXDOMAIN)"))
     else:
-        lines.append("Result: no authentication challenge on this path (may be public).")
-    lines.append("Note: no credentials are sent by this check.")
-    response.close()
-    section(f"Basic auth - {url}")
-    for line in lines:
-        print("  " + line)
-    return lines
+        rows.append(("Result", f"no A records ({resp['rcode_name']})"))
+    return emit(f"Wildcard DNS - {domain}", rows, results)
 
 
-def tls_expiry_checker(target):
+_TAKEOVER_FINGERPRINTS = {
+    "github.io": ["There isn't a GitHub Pages site here"],
+    "herokuapp.com": ["No such app"],
+    "azurewebsites.net": ["404 Web Site not found"],
+    "cloudfront.net": ["ERROR: The request could not be satisfied"],
+    "fastly.net": ["Fastly error: unknown domain"],
+    "s3.amazonaws.com": ["NoSuchBucket"],
+    "bitbucket.io": ["Repository not found"],
+    "wordpress.com": ["Do you want to register"],
+    "tumblr.com": ["There's nothing here"],
+    "myshopify.com": ["Sorry, this shop is currently unavailable"],
+    "pantheonsite.io": ["The gods are wise"],
+    "readthedocs.io": ["This domain is not configured"],
+    "surge.sh": ["project not found"],
+    "ghost.io": ["Domain error"],
+}
+
+
+def tool_57_takeover(domain, results):
+    if not validate_domain(domain):
+        return emit("Takeover", [("Error", f"invalid domain: {domain}")], results)
+    rows = []
+    try:
+        resp = dns_resolve(domain, "CNAME")
+    except DNSError as exc:
+        return emit("Takeover", [("Error", str(exc))], results)
+    cnames = [rr["value"] for rr in resp["answers"] if rr["type"] == 5]
+    if not cnames:
+        rows.append(("CNAME", "none"))
+        return emit(f"Takeover - {domain}", rows, results)
+    target = cnames[0]
+    rows.append(("CNAME", target))
+    match = next((k for k in _TAKEOVER_FINGERPRINTS if target.endswith(k)), None)
+    if not match:
+        rows.append(("Result", "not a known-takeoverable service"))
+        return emit(f"Takeover - {domain}", rows, results)
+    rows.append(("Service", match))
+    try:
+        http_resp = http_request("GET", f"http://{domain}", read_limit=8192)
+        body = http_resp["body"].decode("utf-8", "replace")
+        for fp in _TAKEOVER_FINGERPRINTS[match]:
+            if fp in body:
+                rows.append(("CONFIRMED", f"matched '{fp[:60]}'"))
+                return emit(f"Takeover - {domain}", rows, results)
+        rows.append(("Result", "CNAME matches but body does not"))
+    except Exception as exc:
+        rows.append(("Fetch", f"error: {type(exc).__name__}"))
+    return emit(f"Takeover - {domain}", rows, results)
+
+
+def tool_58_basic_auth(url, results):
+    url = normalize_url(url)
+    if not url:
+        return emit("Basic Auth", [("Error", f"invalid URL: {url}")], results)
+    try:
+        resp = http_request("GET", url, allow_redirects=False, read_limit=512)
+    except Exception as exc:
+        return emit("Basic Auth", [("Error", f"{type(exc).__name__}: {exc}")], results)
+    auth = resp["headers"].get("www-authenticate", [""])[0]
+    rows = [("Status", str(resp["status"])), ("WWW-Authenticate", auth or "(not set)")]
+    if resp["status"] == 401:
+        low = auth.lower()
+        if low.startswith("basic"):
+            rows.append(("Result", "HTTP Basic enforced"))
+        elif low.startswith("digest"):
+            rows.append(("Result", "HTTP Digest enforced"))
+        elif low.startswith("bearer"):
+            rows.append(("Result", "Bearer required"))
+        else:
+            rows.append(("Result", "401 no recognized scheme"))
+    elif resp["status"] in (301, 302, 303, 307, 308):
+        rows.append(("Result", "redirect — follow manually"))
+    else:
+        rows.append(("Result", "no auth challenge on this path"))
+    return emit(f"Basic Auth - {url}", rows, results)
+
+
+def tool_59_tls_expiry(target, results):
     kind, value = classify_target(target)
     if kind == "invalid":
-        error(f"Invalid domain or IP: {target}")
-        return None
+        return emit("TLS Expiry", [("Error", f"invalid target: {target}")], results)
+    if kind == "ip":
+        return emit("TLS Expiry", [("Error", "requires a hostname (SNI)")], results)
     try:
-        info(f"Fetching TLS certificate from {value}:443...")
-        context = ssl.create_default_context()
-        with socket.create_connection((value, 443), timeout=API_TIMEOUT) as sock:
-            with context.wrap_socket(sock, server_hostname=value) as ssock:
-                cert = ssock.getpeercert()
-    except ssl.SSLCertVerificationError as exc:
-        error(f"Certificate verification failed: {getattr(exc, 'reason', exc)}")
-        return None
+        cert_info = tls_fetch_cert(value)
     except Exception as exc:
-        error(f"TLS fetch failed: {type(exc).__name__}")
-        return None
-    if not cert:
-        error("No certificate returned.")
-        return None
-    not_after = cert.get("notAfter")
-    not_before = cert.get("notBefore")
+        return emit("TLS Expiry", [("Error", f"{type(exc).__name__}: {exc}")], results)
+    cert = cert_info["cert"]
     subject = dict(item[0] for item in cert.get("subject", ()))
-    lines = [f"Subject CN: {subject.get('commonName', 'N/A')}"]
-    lines.append(f"notBefore: {not_before}")
-    lines.append(f"notAfter: {not_after}")
-    if not_after:
-        try:
-            expiry = ssl.cert_time_to_seconds(not_after)
-            days_left = (expiry - time.time()) / 86400
-            lines.append(f"Days until expiry: {days_left:.1f}")
-            if days_left < 0:
-                warning("Certificate has EXPIRED.")
-            elif days_left < 14:
-                warning("Certificate expires within 14 days.")
-            elif days_left < 30:
-                warning("Certificate expires within 30 days.")
-            else:
-                success("Certificate valid with more than 30 days remaining.")
-        except Exception as exc:
-            lines.append(f"Could not parse expiry: {type(exc).__name__}")
-    section(f"TLS expiry - {value}")
-    for line in lines:
-        print("  " + line)
-    return lines
+    not_after = cert.get("notAfter", "")
+    rows = [("Subject", subject.get("commonName", "?")),
+            ("notBefore", cert.get("notBefore", "?")),
+            ("notAfter", not_after)]
+    try:
+        expiry = ssl.cert_time_to_seconds(not_after)
+        days = (expiry - time.time()) / 86400
+        rows.append(("Days left", f"{days:.1f}"))
+        if days < 0:
+            rows.append(("WARNING", "certificate EXPIRED"))
+        elif days < 14:
+            rows.append(("WARNING", "expires within 14 days"))
+        elif days < 30:
+            rows.append(("WARNING", "expires within 30 days"))
+        else:
+            rows.append(("Status", "valid > 30 days"))
+    except Exception as exc:
+        rows.append(("Parse", f"error: {type(exc).__name__}"))
+    return emit(f"TLS Expiry - {value}", rows, results)
 
 
-def export_json_results(target):
+def export_txt(target):
     if RESULTS.empty():
-        warning("No results available to export. Perform a lookup first.")
+        warn("no results — run a tool first")
         return
     safe = re.sub(r"[^A-Za-z0-9_.-]", "_", target or "session")
-    default_name = f"{safe}_ipfinder_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
-    filename = ask(f"Export filename [{default_name}]") or default_name
-    if os.path.exists(filename):
-        choice = ask("File exists. Overwrite? (y/n) [n]").lower() or "n"
-        if choice != "y":
-            warning("Export cancelled.")
-            return
+    default = f"{safe}_ipfinder_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+    filename = ask(f"filename [{default}]") or default
+    try:
+        with open(filename, "w", encoding="utf-8") as fh:
+            fh.write(RESULTS.render(target))
+        ok(f"saved to {filename}")
+    except OSError as exc:
+        err(f"write failed: {exc}")
+
+
+def export_json(target):
+    if RESULTS.empty():
+        warn("no results — run a tool first")
+        return
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", target or "session")
+    default = f"{safe}_ipfinder_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+    filename = ask(f"filename [{default}]") or default
     payload = {
-        "tool": TOOL_NAME,
-        "version": VERSION,
+        "tool": TOOL_NAME, "version": VERSION,
         "timestamp": datetime.datetime.now().isoformat(),
         "target": target,
-        "results": [{"title": title, "lines": lines} for title, lines in RESULTS.sections],
+        "results": [{"title": t, "lines": lines} for t, lines in RESULTS.sections],
     }
     try:
         with open(filename, "w", encoding="utf-8") as fh:
             json.dump(payload, fh, ensure_ascii=False, indent=2)
-        success(f"Saved to '{filename}'.")
+        ok(f"saved to {filename}")
     except OSError as exc:
-        error(f"Write failed: {exc}")
+        err(f"write failed: {exc}")
 
 
-def export_results(target):
-    if RESULTS.empty():
-        warning("No results available to export. Perform a lookup first.")
-        return
-    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", target or "session")
-    default_name = f"{safe}_ipfinder_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
-    filename = ask(f"Export filename [{default_name}]") or default_name
-    if os.path.exists(filename):
-        choice = ask("File exists. Overwrite? (y/n) [n]").lower() or "n"
-        if choice != "y":
-            warning("Export cancelled.")
-            return
-    try:
-        with open(filename, "w", encoding="utf-8") as fh:
-            fh.write(RESULTS.render(target))
-        success(f"Saved to '{filename}'.")
-    except OSError as exc:
-        error(f"Write failed: {exc}")
-
-
-def about_and_dependencies():
-    section(f"{TOOL_NAME} v{VERSION}")
-    print(f"  Author   : {AUTHOR}")
-    print("  Platform : Termux / Linux / Windows")
-    ok, missing_req, missing_opt = check_dependencies()
-    if ok:
-        success("All required dependencies present.")
-    else:
-        error("Missing required: " + ", ".join(missing_req))
-        print("  pip install -r requirements.txt")
-    if missing_opt:
-        warning("Optional missing: " + ", ".join(missing_opt))
-    section("Data sources and limits")
-    print("  Geolocation / ASN  : ipwho.is (HTTPS, rate-limited)")
-    print("  Shodan InternetDB  : internetdb.shodan.io (free, no key)")
-    print("  Reverse IP         : api.hackertarget.com (free tier)")
-    print("  BGP prefix         : stat.ripe.net (free, no key)")
-    print("  Team Cymru ASN     : whois.cymru.com:43 (free, no key)")
-    print("  Wayback Machine    : archive.org/wayback/available (free)")
-    print("  DNSBL              : Spamhaus / SpamCop / SORBS / PSBL / UCEPROTECT")
-    print("  RDAP               : rdap.org (public bootstrap)")
-    print("  DNS propagation    : Google / Cloudflare / Quad9 / OpenDNS")
-    print("  WHOIS              : python-whois (registry-dependent)")
-    print("\n  Responsible use: only inspect systems you own or have")
-    print("  permission to test. Some providers rate-limit; retry later.")
-
-
-def menu_lines():
+def menu():
     return [
-        "[::] SELECT A NETWORK TOOL [::]",
-        "",
+        "[::] SELECT A NETWORK TOOL [::]", "",
         f"{DRED}[01]{RESET} Public IP Lookup       {DRED}[09]{RESET} TLS Certificate",
         f"{DRED}[02]{RESET} Reverse DNS            {DRED}[10]{RESET} Subdomain Discovery",
         f"{DRED}[03]{RESET} Domain to IP           {DRED}[11]{RESET} ASN / ISP Lookup",
@@ -3106,353 +2669,175 @@ def menu_lines():
         f"{DRED}[05]{RESET} GeoIP Lookup           {DRED}[13]{RESET} DNS Propagation",
         f"{DRED}[06]{RESET} WHOIS Lookup           {DRED}[14]{RESET} DNSSEC Inspection",
         f"{DRED}[07]{RESET} Common Port Scan       {DRED}[15]{RESET} Subnet Calculator",
-        f"{DRED}[08]{RESET} HTTP Headers",
-        "",
-        f"{CYAN}EXTENDED TOOLS{RESET}",
-        f"{DRED}[16]{RESET} IP Reputation Check    {DRED}[21]{RESET} CDN / WAF Detector",
-        f"{DRED}[17]{RESET} Email Domain Security  {DRED}[22]{RESET} Redirect Chain Analyzer",
-        f"{DRED}[18]{RESET} HTTP Response Diag.    {DRED}[23]{RESET} HTTP Performance",
+        f"{DRED}[08]{RESET} HTTP Headers", "",
+        f"{CYAN}EXTENDED{RESET}",
+        f"{DRED}[16]{RESET} IP Reputation          {DRED}[21]{RESET} CDN / WAF Detector",
+        f"{DRED}[17]{RESET} Email Domain Security  {DRED}[22]{RESET} Redirect Chain",
+        f"{DRED}[18]{RESET} HTTP Diagnostics       {DRED}[23]{RESET} HTTP Performance",
         f"{DRED}[19]{RESET} Local Network Info     {DRED}[24]{RESET} Certificate Transparency",
-        f"{DRED}[20]{RESET} DNS TTL / Cache        {DRED}[25]{RESET} Security Headers",
-        f"{DRED}[26]{RESET} Latency Diagnostics    {DRED}[31]{RESET} Connection Stability",
-        f"{DRED}[27]{RESET} DNS Health Checker     {DRED}[32]{RESET} TLS Compatibility",
+        f"{DRED}[20]{RESET} DNS TTL                {DRED}[25]{RESET} Security Headers",
+        f"{DRED}[26]{RESET} Latency                {DRED}[31]{RESET} Connection Stability",
+        f"{DRED}[27]{RESET} DNS Health             {DRED}[32]{RESET} TLS Compatibility",
         f"{DRED}[28]{RESET} Smart Diagnostic       {DRED}[33]{RESET} HTTP Method Checker",
-        f"{DRED}[29]{RESET} DNS Query Comparison   {DRED}[34]{RESET} IPv6 Readiness",
-        f"{DRED}[30]{RESET} Route Diagnostics      {DRED}[35]{RESET} Historical Results",
-        f"{DRED}[36]{RESET} Batch Domain Checker   {DRED}[39]{RESET} Uptime History",
-        f"{DRED}[37]{RESET} Email DNS Deep Check   {DRED}[40]{RESET} Diagnostic Profiles",
-        f"{DRED}[38]{RESET} Configuration Validator{DRED}[41]{RESET} Web IP Checker",
-        "",
+        f"{DRED}[29]{RESET} DNS Comparison         {DRED}[34]{RESET} IPv6 Readiness",
+        f"{DRED}[30]{RESET} Traceroute (built-in)  {DRED}[35]{RESET} Historical Results",
+        f"{DRED}[36]{RESET} Batch Domains          {DRED}[39]{RESET} Uptime History",
+        f"{DRED}[37]{RESET} Email DNS Deep         {DRED}[40]{RESET} Diagnostic Profiles",
+        f"{DRED}[38]{RESET} Config Validator       {DRED}[41]{RESET} Web IP Checker", "",
         f"{CYAN}PASSIVE RECON{RESET}",
         f"{DRED}[42]{RESET} Shodan InternetDB      {DRED}[46]{RESET} TLS SAN Extractor",
         f"{DRED}[43]{RESET} Port Banner Grab       {DRED}[47]{RESET} Reverse IP Lookup",
         f"{DRED}[44]{RESET} DNS Zone Transfer      {DRED}[48]{RESET} Security.txt / robots",
-        f"{DRED}[45]{RESET} CNAME Chain Tracer     {DRED}[49]{RESET} Bulk IP Geolocation",
-        "",
+        f"{DRED}[45]{RESET} CNAME Chain Tracer     {DRED}[49]{RESET} Bulk IP Geolocation", "",
         f"{CYAN}RECON EXTENDED{RESET}",
-        f"{DRED}[50]{RESET} DNSBL Checker          {DRED}[55]{RESET} CORS Policy Checker",
-        f"{DRED}[51]{RESET} Wayback Machine        {DRED}[56]{RESET} Wildcard DNS Checker",
+        f"{DRED}[50]{RESET} DNSBL Checker          {DRED}[55]{RESET} CORS Policy",
+        f"{DRED}[51]{RESET} Wayback Machine        {DRED}[56]{RESET} Wildcard DNS",
         f"{DRED}[52]{RESET} BGP Prefix (RIPEstat)  {DRED}[57]{RESET} Subdomain Takeover",
-        f"{DRED}[53]{RESET} Team Cymru ASN         {DRED}[58]{RESET} Basic Auth Checker",
-        f"{DRED}[54]{RESET} Cookie Security        {DRED}[59]{RESET} TLS Expiry Checker",
-        "",
-        f"{DRED}[90]{RESET} Export TXT Report",
-        f"{DRED}[91]{RESET} Export JSON Report",
-        f"{DRED}[99]{RESET} About / Dependencies",
-        f"{DRED}[00]{RESET} Exit",
+        f"{DRED}[53]{RESET} Team Cymru ASN         {DRED}[58]{RESET} Basic Auth",
+        f"{DRED}[54]{RESET} Cookie Security        {DRED}[59]{RESET} TLS Expiry", "",
+        f"{DRED}[90]{RESET} Export TXT     {DRED}[91]{RESET} Export JSON",
+        f"{DRED}[99]{RESET} About / Deps   {DRED}[00]{RESET} Exit",
     ]
 
 
-def show_menu(dep_ok, missing_req):
+def show_menu():
     clear_screen()
-    print_banner()
-    if dep_ok:
-        print(f"{CYAN}Status:{RESET} {GREEN}Ready{RESET}")
-    else:
-        print(f"{CYAN}Status:{RESET} {RED}Missing: {', '.join(missing_req)}{RESET}")
-    print()
-    for line in menu_lines():
+    banner()
+    print(f"{CYAN}Status:{RESET} {GREEN}Ready (pure stdlib){RESET}\n")
+    for line in menu():
         print(f"  {line}")
     print()
 
 
-def _dispatch(choice):
-    if choice == "01":
-        ip = get_my_ip()
-        if ip:
-            RESULTS.add("Public IP", [ip])
-    elif choice == "02":
-        ip = ask("Target IP")
-        res = reverse_dns_lookup(ip)
-        RESULTS.add(f"Reverse DNS - {ip}", [res] if res else [])
-    elif choice == "03":
-        domain = ask("Target Domain")
-        res = domain_to_ip(domain)
-        RESULTS.add(f"Domain resolution - {domain}", res or [])
-    elif choice == "04":
-        domain = ask("Target Domain")
-        res = lookup_dns_records(domain)
-        lines = [f"{rtype}: {rec}" for rtype, recs in (res or {}).items() for rec in recs]
-        RESULTS.add(f"DNS records - {domain}", lines)
-    elif choice == "05":
-        ip = ask("Target IP")
-        res = ip_geo_info(ip)
-        RESULTS.add(f"Geolocation - {ip}", res or [])
-    elif choice == "06":
-        target = ask("Target Domain or IP")
-        res = whois_lookup(target)
-        RESULTS.add(f"WHOIS - {target}", [f"{k}: {v}" for k, v in res.items()] if res else [])
-    elif choice == "07":
-        ip = ask("Target IP")
-        res = port_scan(ip)
-        RESULTS.add(f"Port scan - {ip}", res or [])
-    elif choice == "08":
-        target = ask("Target Domain, IP, or URL")
-        res = grab_http_headers(target)
-        lines = []
-        if res:
-            lines.append(f"status: {res['status']}")
-            lines.extend(f"{k}: {v}" for k, v in res.items() if k not in ("status", "url"))
-        RESULTS.add(f"HTTP headers - {target}", lines)
-    elif choice == "09":
-        target = ask("Target Domain or IP")
-        res = grab_https_cert(target)
-        RESULTS.add(f"TLS cert - {target}", res or [])
-    elif choice == "10":
-        domain = ask("Target Domain")
-        res = subdomain_enum(domain)
-        RESULTS.add(f"Subdomains - {domain}", res or [])
-    elif choice == "11":
-        target = ask("Target IP or Domain")
-        res = asn_lookup(target)
-        RESULTS.add(f"ASN / ISP - {target}", res or [])
-    elif choice == "12":
-        target = ask("Target IP or Domain")
-        res = rdap_lookup(target)
-        RESULTS.add(f"RDAP - {target}", res or [])
-    elif choice == "13":
-        domain = ask("Target Domain")
-        rtype = ask(f"Record Type ({'/'.join(PROPAGATION_TYPES)})")
-        res = dns_propagation_check(domain, rtype)
-        RESULTS.add(f"DNS propagation - {domain} {rtype.upper()}", res or [])
-    elif choice == "14":
-        domain = ask("Target Domain")
-        res = dnssec_check(domain)
-        RESULTS.add(f"DNSSEC - {domain}", res or [])
-    elif choice == "15":
-        cidr = ask("CIDR (e.g. 192.168.1.0/24 or 2001:db8::/32)")
-        res = subnet_calculator(cidr)
-        RESULTS.add(f"Subnet - {cidr}", res or [])
-    elif choice == "16":
-        target = ask("Public IP")
-        res = ip_reputation_check(target)
-        RESULTS.add(f"IP reputation - {target}", res or [])
-    elif choice == "17":
-        domain = ask("Email domain")
-        selector = ask("DKIM selector (optional, Enter to skip)")
-        res = email_domain_security(domain, selector or None)
-        RESULTS.add(f"Email domain security - {domain}", res or [])
-    elif choice == "18":
-        target = ask("HTTP/HTTPS URL")
-        res = http_response_diagnostics(target)
-        RESULTS.add(f"HTTP diagnostics - {target}", res or [])
-    elif choice == "19":
-        res = local_network_information()
-        RESULTS.add("Local network information", res or [])
-    elif choice == "20":
-        domain = ask("Target Domain")
-        rtype = ask("Record Type [A]") or "A"
-        res = dns_ttl_cache_inspector(domain, rtype)
-        RESULTS.add(f"DNS TTL - {domain} {rtype.upper()}", res or [])
-    elif choice == "21":
-        target = ask("Target Domain or URL")
-        res = cdn_waf_detector(target)
-        RESULTS.add(f"CDN/WAF - {target}", res or [])
-    elif choice == "22":
-        target = ask("Target URL")
-        res = redirect_chain_analyzer(target)
-        RESULTS.add(f"Redirect chain - {target}", res or [])
-    elif choice == "23":
-        target = ask("Target URL")
-        res = http_performance_breakdown(target)
-        RESULTS.add(f"HTTP performance - {target}", res or [])
-    elif choice == "24":
-        domain = ask("Target Domain")
-        res = certificate_transparency_lookup(domain)
-        RESULTS.add(f"Certificate transparency - {domain}", res or [])
-    elif choice == "25":
-        target = ask("Target URL")
-        res = security_headers_analyzer(target)
-        RESULTS.add(f"Security headers - {target}", res or [])
-    elif choice == "26":
-        target = ask("Target Domain or IP")
-        res = latency_route_diagnostics(target)
-        RESULTS.add(f"Latency diagnostics - {target}", res or [])
-    elif choice == "27":
-        domain = ask("Target Domain")
-        res = dns_health_checker(domain)
-        RESULTS.add(f"DNS health - {domain}", res or [])
-    elif choice == "28":
-        target = ask("Target Domain, IP, or URL")
-        res = smart_diagnostic_report(target)
-        RESULTS.add(f"Smart diagnostic report - {target}", res or [])
-    elif choice == "29":
-        domain = ask("Target Domain")
-        rtype = (ask(f"Record Type ({'/'.join(DNS_RECORD_TYPES)}) [A]") or "A").upper()
-        res = dns_query_comparison(domain, rtype)
-        RESULTS.add(f"DNS comparison - {domain} {rtype}", res or [])
-    elif choice == "30":
-        target = ask("Target Domain or IP")
-        res = route_diagnostics(target)
-        RESULTS.add(f"Route diagnostics - {target}", res or [])
-    elif choice == "31":
-        target = ask("Target Domain, IP, or URL")
-        port = ask("Target TCP port [443]") or "443"
-        samples = ask("Samples (1-30) [5]") or "5"
-        interval = ask("Interval seconds (1-10) [2]") or "2"
-        res = connection_stability_monitor(target, port, samples, interval)
-        RESULTS.add(f"Connection stability - {target}:{port}", res or [])
-    elif choice == "32":
-        target = ask("Target Domain or IP")
-        port = ask("TLS TCP port [443]") or "443"
-        res = tls_compatibility_check(target, port)
-        RESULTS.add(f"TLS compatibility - {target}:{port}", res or [])
-    elif choice == "33":
-        target = ask("Target URL")
-        res = http_method_checker(target)
-        RESULTS.add(f"HTTP method checker - {target}", res or [])
-    elif choice == "34":
-        domain = ask("Target Domain")
-        res = ipv6_readiness_check(domain)
-        RESULTS.add(f"IPv6 readiness - {domain}", res or [])
-    elif choice == "35":
-        res = historical_results()
-        RESULTS.add("Historical results", res or [])
-    elif choice == "36":
-        filepath = ask("Path to TXT file (one domain per line)")
-        res = batch_domain_checker(filepath)
-        RESULTS.add(f"Batch domain checker - {filepath}", res or [])
-    elif choice == "37":
-        domain = ask("Email Domain")
-        res = email_dns_deep_check(domain)
-        RESULTS.add(f"Email DNS deep check - {domain}", res or [])
-    elif choice == "38":
-        res = configuration_validator()
-        RESULTS.add("Configuration validator", res or [])
-    elif choice == "39":
-        target = ask("Target URL or Domain")
-        checks = ask("Checks (1-30) [3]") or "3"
-        interval = ask("Interval seconds (5-60) [5]") or "5"
-        res = uptime_history_monitor(target, checks, interval)
-        RESULTS.add(f"Uptime history - {target}", res or [])
-    elif choice == "40":
-        profile = ask("Profile [Basic/Web/DNS/Full]") or "Basic"
-        target = ask("Target Domain, IP, or URL")
-        res = diagnostic_profiles(profile, target)
-        RESULTS.add(f"Diagnostic profile {profile} - {target}", res or [])
-    elif choice == "41":
-        target = ask("Website URL (e.g. https://example.com)")
-        res = web_ip_checker(target)
-        RESULTS.add(f"Web IP Checker - {target}", res or [])
-    elif choice == "42":
-        target = ask("Target IP or Domain")
-        res = shodan_internetdb(target)
-        RESULTS.add(f"InternetDB - {target}", res or [])
-    elif choice == "43":
-        target = ask("Target IP")
-        res = port_banner_grab(target)
-        RESULTS.add(f"Port banner grab - {target}", res or [])
-    elif choice == "44":
-        domain = ask("Target Domain")
-        res = dns_zone_transfer(domain)
-        RESULTS.add(f"DNS zone transfer - {domain}", res or [])
-    elif choice == "45":
-        domain = ask("Target Domain")
-        res = cname_chain_tracer(domain)
-        RESULTS.add(f"CNAME chain - {domain}", res or [])
-    elif choice == "46":
-        target = ask("Target Domain or IP")
-        res = tls_san_extractor(target)
-        RESULTS.add(f"TLS SANs - {target}", res or [])
-    elif choice == "47":
-        target = ask("Target IP or Domain")
-        res = reverse_ip_lookup(target)
-        RESULTS.add(f"Reverse IP - {target}", res or [])
-    elif choice == "48":
-        target = ask("Target Domain or URL")
-        res = security_txt_check(target)
-        RESULTS.add(f"Well-known files - {target}", res or [])
-    elif choice == "49":
-        domain = ask("Target Domain")
-        res = bulk_geo_lookup(domain)
-        RESULTS.add(f"Bulk geolocation - {domain}", res or [])
-    elif choice == "50":
-        ip = ask("Public IPv4 address")
-        res = dnsbl_check(ip)
-        RESULTS.add(f"DNSBL - {ip}", res or [])
-    elif choice == "51":
-        target = ask("Target URL")
-        res = wayback_lookup(target)
-        RESULTS.add(f"Wayback - {target}", res or [])
-    elif choice == "52":
-        target = ask("Target IP")
-        res = bgp_prefix_lookup(target)
-        RESULTS.add(f"BGP prefix - {target}", res or [])
-    elif choice == "53":
-        target = ask("Target IP")
-        res = team_cymru_asn(target)
-        RESULTS.add(f"Team Cymru ASN - {target}", res or [])
-    elif choice == "54":
-        target = ask("Target URL")
-        res = cookie_security_checker(target)
-        RESULTS.add(f"Cookie security - {target}", res or [])
-    elif choice == "55":
-        target = ask("Target URL")
-        res = cors_policy_checker(target)
-        RESULTS.add(f"CORS policy - {target}", res or [])
-    elif choice == "56":
-        domain = ask("Target Domain")
-        res = wildcard_dns_checker(domain)
-        RESULTS.add(f"Wildcard DNS - {domain}", res or [])
-    elif choice == "57":
-        domain = ask("Subdomain to test (e.g. blog.example.com)")
-        res = subdomain_takeover_checker(domain)
-        RESULTS.add(f"Subdomain takeover - {domain}", res or [])
-    elif choice == "58":
-        target = ask("Target URL")
-        res = basic_auth_checker(target)
-        RESULTS.add(f"Basic auth - {target}", res or [])
-    elif choice == "59":
-        target = ask("Target Domain or IP")
-        res = tls_expiry_checker(target)
-        RESULTS.add(f"TLS expiry - {target}", res or [])
-    elif choice == "91":
-        label = ask("Export target label [session]") or "session"
-        export_json_results(label)
+def about():
+    section("About")
+    rows = [
+        ("Tool", f"{TOOL_NAME} v{VERSION}"),
+        ("Author", AUTHOR),
+        ("Dependencies", "Python 3.10+ standard library ONLY"),
+        ("DNS", "custom wire-format resolver (UDP + TCP)"),
+        ("HTTP", "http.client + ssl"),
+        ("WHOIS", "custom port-43 referral chain"),
+        ("Traceroute", "ICMP raw / TCP SYN via IP_RECVERR"),
+        ("Sources", "ipify, ipwho.is, rdap.org, crt.sh, internetdb.shodan.io, "
+                    "stat.ripe.net, whois.cymru.com, hackertarget, archive.org, "
+                    "ipaddress.to, DNSBL zones, public resolvers"),
+        ("Responsible use", "only targets you own or have permission to inspect"),
+    ]
+    for k, v in rows:
+        print(f"  {k:<16}{v}")
+
+
+def dispatch(choice):
+    if choice == "01": return tool_01_public_ip(RESULTS)
+    if choice == "02": return tool_02_reverse_dns(ask("Target IP"), RESULTS)
+    if choice == "03": return tool_03_domain_to_ip(ask("Target Domain"), RESULTS)
+    if choice == "04": return tool_04_dns_records(ask("Target Domain"), RESULTS)
+    if choice == "05": return tool_05_geoip(ask("Target IP"), RESULTS)
+    if choice == "06": return tool_06_whois(ask("Target Domain or IP"), RESULTS)
+    if choice == "07": return tool_07_port_scan(ask("Target IP"), RESULTS)
+    if choice == "08": return tool_08_http_headers(ask("Target URL/host"), RESULTS)
+    if choice == "09": return tool_09_tls_cert(ask("Target hostname"), RESULTS)
+    if choice == "10": return tool_10_subdomains(ask("Target Domain"), RESULTS)
+    if choice == "11": return tool_11_asn(ask("Target IP or Domain"), RESULTS)
+    if choice == "12": return tool_12_rdap(ask("Target IP or Domain"), RESULTS)
+    if choice == "13":
+        d = ask("Target Domain"); r = ask("Record type [A]") or "A"
+        return tool_13_propagation(d, r, RESULTS)
+    if choice == "14": return tool_14_dnssec(ask("Target Domain"), RESULTS)
+    if choice == "15": return tool_15_subnet(ask("CIDR"), RESULTS)
+    if choice == "16": return tool_16_ip_reputation(ask("Public IP"), RESULTS)
+    if choice == "17":
+        d = ask("Email domain"); s = ask("DKIM selector (optional)") or None
+        return tool_17_email_security(d, s, RESULTS)
+    if choice == "18": return tool_18_http_diag(ask("Target URL"), RESULTS)
+    if choice == "19": return tool_19_local_network(RESULTS)
+    if choice == "20":
+        d = ask("Target Domain"); r = ask("Record type [A]") or "A"
+        return tool_20_ttl(d, r, RESULTS)
+    if choice == "21": return tool_21_cdn_waf(ask("Target URL"), RESULTS)
+    if choice == "22": return tool_22_redirects(ask("Target URL"), RESULTS)
+    if choice == "23": return tool_23_http_perf(ask("Target URL"), RESULTS)
+    if choice == "24": return tool_24_ct(ask("Target Domain"), RESULTS)
+    if choice == "25": return tool_25_security_headers(ask("Target URL"), RESULTS)
+    if choice == "26": return tool_26_latency(ask("Target host/IP"), RESULTS)
+    if choice == "27": return tool_27_dns_health(ask("Target Domain"), RESULTS)
+    if choice == "28": return tool_28_smart(ask("Target"), RESULTS)
+    if choice == "29":
+        d = ask("Target Domain"); r = ask("Record type [A]") or "A"
+        return tool_29_dns_compare(d, r, RESULTS)
+    if choice == "30": return tool_30_traceroute(ask("Target host"), RESULTS)
+    if choice == "31":
+        t = ask("Target host"); p = ask("Port [443]") or "443"
+        s = ask("Samples (1-30) [5]") or "5"; i = ask("Interval seconds [2]") or "2"
+        return tool_31_connection_stability(t, p, s, i, RESULTS)
+    if choice == "32":
+        t = ask("Target host"); p = ask("TLS port [443]") or "443"
+        return tool_32_tls_compat(t, p, RESULTS)
+    if choice == "33": return tool_33_http_method(ask("Target URL"), RESULTS)
+    if choice == "34": return tool_34_ipv6_readiness(ask("Target Domain"), RESULTS)
+    if choice == "35": return tool_35_historical(RESULTS)
+    if choice == "36": return tool_36_batch_domains(ask("Path to domain list"), RESULTS)
+    if choice == "37": return tool_37_email_deep(ask("Email domain"), RESULTS)
+    if choice == "38": return tool_38_config_validator(RESULTS)
+    if choice == "39":
+        t = ask("Target URL"); c = ask("Checks (1-30) [3]") or "3"
+        i = ask("Interval seconds (5-60) [5]") or "5"
+        return tool_39_uptime(t, c, i, RESULTS)
+    if choice == "40":
+        p = ask("Profile [basic/web/dns/full]") or "basic"
+        t = ask("Target")
+        return tool_40_profiles(p, t, RESULTS)
+    if choice == "41": return tool_41_web_ip(ask("Target URL"), RESULTS)
+    if choice == "42": return tool_42_internetdb(ask("Target IP or Domain"), RESULTS)
+    if choice == "43": return tool_43_banner(ask("Target IP"), RESULTS)
+    if choice == "44": return tool_44_zone_transfer(ask("Target Domain"), RESULTS)
+    if choice == "45": return tool_45_cname_chain(ask("Target Domain"), RESULTS)
+    if choice == "46": return tool_46_tls_sans(ask("Target hostname"), RESULTS)
+    if choice == "47": return tool_47_reverse_ip(ask("Target IP or Domain"), RESULTS)
+    if choice == "48": return tool_48_security_txt(ask("Target URL/host"), RESULTS)
+    if choice == "49": return tool_49_bulk_geo(ask("Target Domain"), RESULTS)
+    if choice == "50": return tool_50_dnsbl(ask("Public IPv4"), RESULTS)
+    if choice == "51": return tool_51_wayback(ask("Target URL"), RESULTS)
+    if choice == "52": return tool_52_bgp(ask("Target IP"), RESULTS)
+    if choice == "53": return tool_53_cymru_asn(ask("Target IP"), RESULTS)
+    if choice == "54": return tool_54_cookies(ask("Target URL"), RESULTS)
+    if choice == "55": return tool_55_cors(ask("Target URL"), RESULTS)
+    if choice == "56": return tool_56_wildcard_dns(ask("Target Domain"), RESULTS)
+    if choice == "57": return tool_57_takeover(ask("Subdomain"), RESULTS)
+    if choice == "58": return tool_58_basic_auth(ask("Target URL"), RESULTS)
+    if choice == "59": return tool_59_tls_expiry(ask("Target hostname"), RESULTS)
+    if choice == "90":
+        export_txt(ask("Export label") or "session")
         return
-    elif choice == "90":
-        label = ask("Export target label [session]") or "session"
-        export_results(label)
+    if choice == "91":
+        export_json(ask("Export label") or "session")
         return
-    elif choice == "99":
-        about_and_dependencies()
+    if choice == "99":
+        about()
         return
-    elif choice == "00":
+    if choice == "00":
         print(f"\n{CYAN}Goodbye.{RESET}")
         sys.exit(0)
-    else:
-        error(f"Unknown option: {choice}")
+    err(f"unknown option: {choice}")
 
 
-def run_menu_loop():
-    ok, missing_req, _ = check_dependencies()
+def main():
     while True:
         try:
-            show_menu(ok, missing_req)
+            show_menu()
             try:
                 choice = input(f"{GREEN}[~]{RESET} Select [00-99]: ").strip()
             except EOFError:
                 print(f"\n{CYAN}Goodbye.{RESET}")
                 return
-            _dispatch(choice)
+            dispatch(choice)
         except KeyboardInterrupt:
-            print(f"\n{CYAN}Interrupted. Goodbye.{RESET}")
+            print(f"\n{CYAN}Interrupted.{RESET}")
             return
         except Exception as exc:
-            error(f"Unexpected error: {type(exc).__name__}: {exc}")
+            err(f"unexpected: {type(exc).__name__}: {exc}")
         pause()
-
-
-def main():
-    ok, missing_req, missing_opt = check_dependencies()
-    load_optional_imports()
-    if missing_opt:
-        warning(f"Optional dependencies missing: {', '.join(missing_opt)}")
-    if not ok:
-        error("Required dependencies missing: " + ", ".join(missing_req))
-        print("  pip install -r requirements.txt")
-        sys.exit(1)
-    run_menu_loop()
 
 
 if __name__ == "__main__":
