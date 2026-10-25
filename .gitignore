@@ -1,0 +1,9 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+*.log
+*_ipfinder_*.txt
+*_ipfinder_*.json
+# User diagnostics are stored outside the repository in ~/.ip-finder/
