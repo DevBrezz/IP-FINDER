@@ -166,12 +166,31 @@ class AllFeatureRegressionTests(unittest.TestCase):
         self.assertTrue(any("Network address  : 192.0.2.0" in line for line in result))
         self.assertTrue(any("Usable hosts     : 254" in line for line in result))
 
-    def test_16_ip_reputation_without_key_does_not_query(self):
-        with mock.patch.dict(os.environ, {"ABUSEIPDB_API_KEY": ""}):
-            with mock.patch.object(app, "_requests") as fake_requests:
-                result = self.capture(app.ip_reputation_check, "8.8.8.8")
-        self.assertIn("Status: not queried", result)
-        fake_requests.get.assert_not_called()
+    def test_16_ip_reputation_uses_keyless_provider(self):
+        response = mock.MagicMock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {
+            "success": True,
+            "ip": "8.8.8.8",
+            "score": 2,
+            "risk": "low",
+            "location": {"country": "United States", "city": "Example"},
+            "asn": {"asn": "AS15169", "org": "Example Network"},
+            "checks": {
+                "vpn_detected": False,
+                "commercial_proxy": False,
+                "tor_exit": False,
+                "blocklist_listed": False,
+                "blocklist_count": 0,
+            },
+        }
+        with mock.patch.object(app, "_requests") as fake_requests:
+            fake_requests.get.return_value = response
+            result = self.capture(app.ip_reputation_check, "8.8.8.8")
+        fake_requests.get.assert_called_once()
+        args, kwargs = fake_requests.get.call_args
+        self.assertEqual(args[0], "https://ipaddress.to/api/score/8.8.8.8")
+        self.assertIn("Risk score: 2/100", result)
 
     def test_17_email_domain_security(self):
         class Record:
